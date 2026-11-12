@@ -11,10 +11,12 @@ mod memory;
 mod model;
 mod store;
 
-#[cfg(target_os = "macos")]
+// The FFI driver links the system libsqlite3. macOS ships it in the SDK;
+// Linux needs libsqlite3-dev, which CI installs before the test step.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[path = "sqlite.rs"]
 mod sqlite;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[path = "sqlite_stub.rs"]
 mod sqlite;
 
