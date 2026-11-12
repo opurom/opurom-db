@@ -3,11 +3,16 @@
 //! This driver speaks plain TCP startup and simple `Query` messages only. It
 //! accepts `AuthenticationOk` and rejects any other authentication request,
 //! binary result columns, oversized frames and slow or truncated responses.
+//! [`PgConnection::connect_tls`] adds a rustls TLS 1.2/1.3 transport that
+//! negotiates the encrypted session before the startup message.
 
 use crate::{Database, DbError, Row, Value};
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: i32 = 196608;
@@ -30,10 +35,104 @@ const OID_INT2: i32 = 21;
 const OID_INT4: i32 = 23;
 const OID_OID: i32 = 26;
 
-/// A plain-TCP PostgreSQL v3 connection using the simple query protocol.
+const SSL_REQUEST_CODE: i32 = 80_877_103;
+
+/// The encrypted or plain transport carrying the PostgreSQL protocol bytes.
+#[derive(Debug)]
+enum Transport {
+    Plain(TcpStream),
+    Tls(StreamOwned<ClientConnection, TcpStream>),
+}
+
+impl Read for Transport {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Transport::Plain(stream) => stream.read(buffer),
+            Transport::Tls(stream) => stream.read(buffer),
+        }
+    }
+}
+
+impl Write for Transport {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self {
+            Transport::Plain(stream) => stream.write(buffer),
+            Transport::Tls(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Transport::Plain(stream) => stream.flush(),
+            Transport::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
+impl Transport {
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Transport::Plain(stream) => stream.set_read_timeout(timeout),
+            Transport::Tls(stream) => stream.get_ref().set_read_timeout(timeout),
+        }
+    }
+
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Transport::Plain(stream) => stream.set_write_timeout(timeout),
+            Transport::Tls(stream) => stream.get_ref().set_write_timeout(timeout),
+        }
+    }
+
+    /// Run the TLS handshake with a deadline, reporting certificate failures
+    /// as such instead of a generic I/O error.
+    fn handshake(&mut self) -> Result<(), DbError> {
+        let Transport::Tls(tls) = self else {
+            return Ok(());
+        };
+        let StreamOwned { conn, sock } = tls;
+        let deadline = Instant::now() + IO_TIMEOUT;
+        while conn.is_handshaking() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(DbError::new(format!(
+                    "postgres TLS handshake timed out after {} ms",
+                    IO_TIMEOUT.as_millis()
+                )));
+            }
+            sock.set_read_timeout(Some(remaining)).map_err(|error| {
+                DbError::new(format!(
+                    "postgres TLS handshake timeout setup failed: {error}"
+                ))
+            })?;
+            match conn.complete_io(sock) {
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Err(DbError::new(format!(
+                        "postgres TLS handshake timed out after {} ms",
+                        IO_TIMEOUT.as_millis()
+                    )));
+                }
+                Err(error) => {
+                    return Err(DbError::new(format!(
+                        "postgres TLS handshake failed: {error}"
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A PostgreSQL v3 connection using the simple query protocol.
 #[derive(Debug)]
 pub struct PgConnection {
-    stream: TcpStream,
+    stream: Transport,
     parameters: BTreeMap<String, String>,
     backend_key: Option<(i32, i32)>,
     broken: bool,
@@ -50,7 +149,68 @@ impl PgConnection {
         let startup = startup_message(user, database)?;
         let stream = connect_stream(host, port)?;
         let mut connection = PgConnection {
-            stream,
+            stream: Transport::Plain(stream),
+            parameters: BTreeMap::new(),
+            backend_key: None,
+            broken: false,
+        };
+        connection.write_all_deadline(&startup, Instant::now() + IO_TIMEOUT)?;
+        connection.read_startup(Instant::now() + IO_TIMEOUT)?;
+        Ok(connection)
+    }
+
+    /// Connect over TLS 1.2/1.3, negotiating the encrypted session before the
+    /// startup message so every protocol byte travels inside TLS.
+    ///
+    /// `server_name` is the name the certificate must be valid for. `trust` is
+    /// the explicit trust anchor, as DER bytes; without it no anchor is
+    /// trusted and every certificate is rejected.
+    pub fn connect_tls(
+        host: &str,
+        port: u16,
+        user: &str,
+        database: &str,
+        server_name: &str,
+        trust: Option<&[u8]>,
+    ) -> Result<PgConnection, DbError> {
+        let startup = startup_message(user, database)?;
+        let name = ServerName::try_from(server_name.to_string()).map_err(|_| {
+            DbError::new(format!(
+                "postgres TLS server name {server_name:?} is not a valid DNS name or IP address"
+            ))
+        })?;
+        let mut roots = RootCertStore::empty();
+        if let Some(anchor) = trust {
+            roots
+                .add(CertificateDer::from(anchor.to_vec()))
+                .map_err(|error| {
+                    DbError::new(format!(
+                        "postgres TLS trust anchor is not a usable certificate: {error}"
+                    ))
+                })?;
+        }
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut stream = connect_stream(host, port)?;
+        stream
+            .write_all(&ssl_request())
+            .map_err(|error| io_failure("SSLRequest write", error))?;
+        let mut reply = [0u8; 1];
+        stream
+            .read_exact(&mut reply)
+            .map_err(|error| io_failure("SSLRequest reply read", error))?;
+        if reply[0] != b'S' {
+            return Err(DbError::new(
+                "postgres server refused the TLS request; it does not support SSL",
+            ));
+        }
+        let connection = ClientConnection::new(Arc::new(config), name)
+            .map_err(|error| DbError::new(format!("postgres TLS setup failed: {error}")))?;
+        let mut transport = Transport::Tls(StreamOwned::new(connection, stream));
+        transport.handshake()?;
+        let mut connection = PgConnection {
+            stream: transport,
             parameters: BTreeMap::new(),
             backend_key: None,
             broken: false,
@@ -68,6 +228,18 @@ impl PgConnection {
     /// Return the `(process id, secret key)` from `BackendKeyData`.
     pub fn backend_key(&self) -> Option<(i32, i32)> {
         self.backend_key
+    }
+
+    /// The negotiated TLS version, or `None` on a plain connection.
+    pub fn tls_version(&self) -> Option<&'static str> {
+        match &self.stream {
+            Transport::Plain(_) => None,
+            Transport::Tls(tls) => match tls.conn.protocol_version() {
+                Some(rustls::ProtocolVersion::TLSv1_2) => Some("TLSv1.2"),
+                Some(rustls::ProtocolVersion::TLSv1_3) => Some("TLSv1.3"),
+                _ => Some("unknown"),
+            },
+        }
     }
 
     /// Run a simple query and expose its text-format rows.
@@ -485,6 +657,14 @@ fn frame_length(payload_len: usize, what: &str) -> Result<i32, DbError> {
     Ok(length as i32)
 }
 
+/// The eight-byte SSLRequest frame that asks a server to start TLS.
+fn ssl_request() -> Vec<u8> {
+    let mut frame = Vec::with_capacity(8);
+    frame.extend_from_slice(&8i32.to_be_bytes());
+    frame.extend_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
+    frame
+}
+
 fn startup_message(user: &str, database: &str) -> Result<Vec<u8>, DbError> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
@@ -604,8 +784,9 @@ fn parse_error_response(body: &[u8]) -> Result<DbError, DbError> {
     };
     let severity = field(b'V').or_else(|| field(b'S')).unwrap_or("ERROR");
     let message = field(b'M').unwrap_or("no message supplied");
+    let sqlstate = field(b'C');
     let mut text = format!("postgres {severity}");
-    if let Some(sqlstate) = field(b'C') {
+    if let Some(sqlstate) = sqlstate {
         text.push_str(&format!(" [SQLSTATE {sqlstate}]"));
     }
     text.push_str(&format!(": {message}"));
@@ -614,7 +795,10 @@ fn parse_error_response(body: &[u8]) -> Result<DbError, DbError> {
             text.push_str(&format!("; {label}: {value}"));
         }
     }
-    Ok(DbError::new(text))
+    Ok(match sqlstate {
+        Some(sqlstate) => DbError::with_sqlstate(sqlstate, text),
+        None => DbError::new(text),
+    })
 }
 
 fn parse_row_description(body: &[u8]) -> Result<Vec<Column>, DbError> {

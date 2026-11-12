@@ -12,6 +12,7 @@ mod kv;
 mod memory;
 mod model;
 mod pg;
+mod pgserver;
 mod pool;
 mod store;
 
@@ -32,6 +33,7 @@ pub use model::{
     validate_ident, validate_model, write_migrations, Field, FieldType, Model,
 };
 pub use pg::PgConnection;
+pub use pgserver::{PgAuth, PgServer, PgServerOptions, PgTls};
 pub use pool::PooledDb;
 pub use sqlite::Sqlite;
 
@@ -158,21 +160,37 @@ impl Row {
     }
 }
 
-/// A readable, non-panicking error carrying the underlying driver message.
+/// A readable, non-panicking error carrying the underlying driver message and,
+/// when the driver supplies one, a SQLSTATE code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DbError {
     message: String,
+    sqlstate: Option<String>,
 }
 
 impl DbError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            sqlstate: None,
+        }
+    }
+
+    /// Build an error carrying the SQLSTATE reported by a PostgreSQL server.
+    pub fn with_sqlstate(sqlstate: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            sqlstate: Some(sqlstate.into()),
         }
     }
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// The SQLSTATE code, when the driver reported one.
+    pub fn sqlstate(&self) -> Option<&str> {
+        self.sqlstate.as_deref()
     }
 }
 
