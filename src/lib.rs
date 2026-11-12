@@ -1,16 +1,18 @@
-//! OPUROM R2/R5 data layer.
+//! OPUROM R2/R5/R8 data layer.
 //!
-//! Four interchangeable [`Database`] drivers: [`Sqlite`] (direct FFI to the
+//! Five interchangeable [`Database`] drivers: [`Sqlite`] (direct FFI to the
 //! macOS/Linux system libsqlite3), [`PgConnection`] (pure-std PostgreSQL v3
-//! simple-query TCP frontend), [`Kv`] (file-backed key/value store) and
-//! [`Memory`] (volatile). [`PooledDb`] shares one Mutex-serialized `Sqlite`
-//! connection between threads. IR model definitions drive type-correct CRUD
-//! SQL and deterministic migration files.
+//! simple-query TCP frontend), [`MySqlConnection`] (pure-std MySQL v10
+//! text-query frontend), [`Kv`] (file-backed key/value store) and [`Memory`]
+//! (volatile). [`PooledDb`] shares one Mutex-serialized `Sqlite` connection
+//! between threads. IR model definitions drive type-correct CRUD SQL and
+//! deterministic migration files.
 
 mod crud;
 mod kv;
 mod memory;
 mod model;
+mod mysql;
 mod pg;
 mod pgserver;
 mod pool;
@@ -32,12 +34,45 @@ pub use model::{
     create_table_sql, migration_files, parse_models, parse_models_value, schema_sql, sql_literal,
     validate_ident, validate_model, write_migrations, Field, FieldType, Model,
 };
+pub use mysql::MySqlConnection;
 pub use pg::PgConnection;
 pub use pgserver::{PgAuth, PgServer, PgServerOptions, PgTls};
 pub use pool::PooledDb;
 pub use sqlite::Sqlite;
 
 use std::fmt;
+
+/// The typed category of a MySQL server error code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MySqlErrorKind {
+    Syntax,
+    TableNotFound,
+    DuplicateEntry,
+    AccessDenied,
+    Other,
+}
+
+impl MySqlErrorKind {
+    pub(crate) fn from_code(code: u16) -> MySqlErrorKind {
+        match code {
+            1064 => MySqlErrorKind::Syntax,
+            1146 => MySqlErrorKind::TableNotFound,
+            1062 => MySqlErrorKind::DuplicateEntry,
+            1045 => MySqlErrorKind::AccessDenied,
+            _ => MySqlErrorKind::Other,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            MySqlErrorKind::Syntax => "syntax error",
+            MySqlErrorKind::TableNotFound => "table not found",
+            MySqlErrorKind::DuplicateEntry => "duplicate entry",
+            MySqlErrorKind::AccessDenied => "access denied",
+            MySqlErrorKind::Other => "server error",
+        }
+    }
+}
 
 /// A typed cell value matching the IR field types `int`, `string` and `bool`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,12 +195,14 @@ impl Row {
     }
 }
 
-/// A readable, non-panicking error carrying the underlying driver message and,
-/// when the driver supplies one, a SQLSTATE code.
+/// A readable, non-panicking error carrying the underlying driver message,
+/// an optional SQLSTATE and an optional MySQL error code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DbError {
     message: String,
     sqlstate: Option<String>,
+    mysql_code: Option<u16>,
+    mysql_kind: Option<MySqlErrorKind>,
 }
 
 impl DbError {
@@ -173,6 +210,8 @@ impl DbError {
         Self {
             message: message.into(),
             sqlstate: None,
+            mysql_code: None,
+            mysql_kind: None,
         }
     }
 
@@ -181,6 +220,18 @@ impl DbError {
         Self {
             message: message.into(),
             sqlstate: Some(sqlstate.into()),
+            mysql_code: None,
+            mysql_kind: None,
+        }
+    }
+
+    /// Build a typed error carrying a MySQL error code and optional SQLSTATE.
+    pub fn with_mysql_error(code: u16, sqlstate: Option<&str>, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            sqlstate: sqlstate.map(str::to_string),
+            mysql_code: Some(code),
+            mysql_kind: Some(MySqlErrorKind::from_code(code)),
         }
     }
 
@@ -191,6 +242,16 @@ impl DbError {
     /// The SQLSTATE code, when the driver reported one.
     pub fn sqlstate(&self) -> Option<&str> {
         self.sqlstate.as_deref()
+    }
+
+    /// The MySQL server error code, when this error came from an ERR packet.
+    pub fn mysql_code(&self) -> Option<u16> {
+        self.mysql_code
+    }
+
+    /// The typed category of a MySQL server error code.
+    pub fn mysql_error_kind(&self) -> Option<MySqlErrorKind> {
+        self.mysql_kind
     }
 }
 
@@ -208,7 +269,8 @@ pub trait Database {
     fn query(&mut self, sql: &str) -> Result<Vec<Row>, DbError>;
 
     /// Run `sql` with `?` placeholders bound to `params`. SQLite binds natively;
-    /// other drivers substitute safely quoted literals through [`sql_literal`].
+    /// Kv/Memory/PgConnection/MySqlConnection substitute safely quoted literals
+    /// through [`sql_literal`].
     fn exec_params(&mut self, sql: &str, params: &[Value]) -> Result<(), DbError> {
         self.exec(&substitute_params(sql, params)?)
     }

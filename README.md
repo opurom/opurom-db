@@ -1,13 +1,14 @@
 # opurom-db
 
-R2/R4/R5/R7 data layer for OPUROM: one `Database` trait over four drivers,
+R2/R4/R5/R7/R8 data layer for OPUROM: one `Database` trait over five drivers,
 typed IR-driven CRUD helpers, deterministic SQL migrations, an R4 shared SQLite
-handle, an R5 pure-std PostgreSQL v3 frontend and an R7 TLS client plus a
-bundled PostgreSQL-protocol conformance server. Rust 1.99.1; PostgreSQL uses
-`std::net::TcpStream` and, since R7, the pinned pure-Rust `rustls` 0.23.46
-(no OpenSSL, no C toolchain: the `ring` provider is selected explicitly).
-SQLite is reached through direct FFI to the system `libsqlite3`
-(`#[link(name = "sqlite3")]`), with no SQLite crate.
+handle, an R5 pure-std PostgreSQL v3 frontend, an R7 TLS client plus a
+bundled PostgreSQL-protocol conformance server, and an R8 pure-std MySQL
+protocol v10 frontend with a pure-Rust SHA-1 `mysql_native_password` response.
+Rust 1.99.1; PostgreSQL uses `std::net::TcpStream` and, since R7, the pinned
+pure-Rust `rustls` 0.23.46 (no OpenSSL, no C toolchain: the `ring` provider is
+selected explicitly). SQLite is reached through direct FFI to the system
+`libsqlite3` (`#[link(name = "sqlite3")]`), with no SQLite crate.
 
 ## Public API
 
@@ -17,7 +18,7 @@ pub trait Database {
     fn query(&mut self, sql: &str) -> Result<Vec<Row>, DbError>;
 
     // Default methods. SQLite overrides these with real sqlite3_bind_* calls;
-    // Kv/Memory/PgConnection substitute safely quoted literals.
+    // Kv/Memory/PgConnection/MySqlConnection substitute safely quoted literals.
     fn exec_params(&mut self, sql: &str, params: &[Value]) -> Result<(), DbError>;
     fn query_params(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError>;
 }
@@ -30,6 +31,10 @@ pub trait Database {
 | `PgConnection::exec` / `query` | simple `Query`; implements `Database` for CRUD routing |
 | `PgConnection::parameter(name)` / `backend_key()` | parsed startup `ParameterStatus` / `BackendKeyData` |
 | `PgConnection::tls_version()` | negotiated TLS version (`Some("TLSv1.3")`), `None` on a plain connection |
+| `MySqlConnection::connect(host, port, user, password, database)` | protocol 10 handshake; `mysql_native_password` only |
+| `MySqlConnection::exec` / `query` | `COM_QUERY`; implements `Database` for CRUD routing |
+| `MySqlConnection::server_version()` and other handshake getters | parsed server version, connection id, capabilities, charset, status and plugin |
+| `MySqlErrorKind` | typed MySQL error categories: syntax, table not found, duplicate entry, access denied, other |
 | `PgServer::start(PgServerOptions)` | bundled v3 protocol server on an ephemeral loopback port |
 | `PgServer::address()` / `port()` | the bound loopback address |
 | `PgServerOptions { auth, tls }` | `PgAuth::Trust` / `PgAuth::Cleartext`, optional `PgTls` certificate and key |
@@ -43,7 +48,7 @@ pub trait Database {
 | `Memory::new()` | volatile store, `Default` implemented |
 | `Value::{Int(i64), Text(String), Bool(bool)}` | `as_i64` / `as_str` / `as_bool` |
 | `Row::get(&str) -> Option<&Value>` | plus `Row::new()`, `insert`, `set`, `columns`, `len`, `is_empty` |
-| `DbError` | `Display`, `Debug`, `std::error::Error`; driver message plus optional `sqlstate()` |
+| `DbError` | `Display`, `Debug`, `std::error::Error`; driver message, optional `sqlstate()`, `mysql_code()` and `mysql_error_kind()` |
 
 `Row::insert(name, value)` works both in place (`let mut r = Row::new();
 r.insert(...);`) and as a builder (`Row::new().insert(...).insert(...)`);
@@ -161,6 +166,37 @@ transaction API, no COPY protocol and no binary result decoding. A 500 ms
 per-address connect timeout, write deadline and response deadline, a 16 MiB
 frame and cumulative response budget, a 65,536-row cap and a 1,600-column
 cap bound memory and waiting.
+
+### MySQL v10 (`MySqlConnection`)
+
+`MySqlConnection::connect("127.0.0.1", 3306, "user", "secret", "db")`
+parses the protocol-10 initial handshake (server version, connection id,
+auth-plugin-data part 1+2, capability flags, charset and status) and sends a
+HandshakeResponse41 with `mysql_native_password`. SHA-1 is implemented in pure
+Rust and checked against known-answer vectors; the scramble is
+`SHA1(password) XOR SHA1(nonce || SHA1(SHA1(password)))`. `query(sql)` sends
+`COM_QUERY` and parses OK (0x00 or 0xFE with len<9), ERR (error code plus
+SQLSTATE when `CLIENT_PROTOCOL_41`), EOF, the column-count packet, column
+definitions, text rows and the final EOF/OK. Integer columns become
+`Value::Int`, `TINY(1)` `1`/`0` becomes `Value::Bool`, other columns become
+`Value::Text`, and SQL NULL is omitted. An ERR packet becomes a typed
+`DbError`: `mysql_code()` carries 1064/1146/1062/1045 and
+`mysql_error_kind()` maps them to syntax, table not found, duplicate entry or
+access denied; `sqlstate()` carries the five-byte SQLSTATE.
+
+The local TCP conformance test in `tests/mysql_protocol.rs` speaks the real
+wire bytes against a mock server on an ephemeral loopback port: successful
+handshake and two-row query, ERR with SQLSTATE, truncated/malformed packets,
+packet-size bounds, sequence-id mismatches, auth failure, unsupported
+`caching_sha2_password`, and `CLIENT_DEPRECATE_EOF` OK packets. No external
+MySQL server is contacted and no server process is left running. A 1 MiB
+packet cap, 16 MiB cumulative response budget, 65,536-row cap, 1,600-column
+cap, strict sequence ids and 500 ms I/O deadlines bound allocations and
+waiting.
+
+Honest scope: no caching_sha2_password, no TLS negotiation, no prepared
+statements, no connection pooling, no binary result decoding, no LOCAL INFILE,
+no multi-result sets, and no real MySQL server tested. Those remain R9+.
 
 ### TLS client (`PgConnection::connect_tls`)
 
@@ -300,12 +336,23 @@ rejection of an untrusted self-signed certificate, the rejection of a
 certificate that does not chain to the supplied anchor, a plaintext server
 that refuses TLS, and a session that stays usable after a failed statement.
 
-`cargo test` therefore runs 29 integration tests (0 unit tests, 0 doc tests).
-Sockets bind to `127.0.0.1` on ephemeral ports and every server runs on
-background threads of the test process, so no external PostgreSQL server is
-contacted and no server process is left running.
+Eight R8 integration tests in `tests/mysql_protocol.rs` speak real MySQL v10
+bytes against a loopback mock server: handshake with the native-password
+scramble, a two-row `COM_QUERY` result, typed ERR/SQLSTATE mapping (1064, 1146,
+1062 and 1045), truncated/malformed packets, packet-size and column-count
+bounds, sequence-id mismatches, auth failure, unsupported
+`caching_sha2_password` and deprecated-EOF OK packets. Four unit tests in
+`src/mysql.rs` check SHA-1 known-answer vectors and the native-password
+scramble vector.
 
-## Honest status (R7)
+All 29 R7 integration tests remain green. `cargo test --offline` therefore runs
+37 integration tests, 4 unit tests and 0 doc tests (41 total). `cargo fmt
+--all` and `RUSTFLAGS="-D warnings" cargo test --offline` pass with zero
+warnings. Sockets bind to `127.0.0.1` on ephemeral ports and every server runs
+on background threads of the test process, so no external PostgreSQL or MySQL
+server is contacted and no server process is left running.
+
+## Honest status (R8)
 
 Verified: SQLite via FFI on macOS/Linux, embedded file-backed KV, in-memory
 store, typed CRUD helpers, deterministic/idempotent migration SQL, identifier
@@ -318,17 +365,24 @@ verified against the bundled PostgreSQL-protocol server over real sockets:
 TLS 1.3 negotiation before the startup message with real certificate
 verification and rejection of an untrusted certificate, a real multi-statement
 transaction with commit and rollback, and SQLSTATE-to-`DbError` mapping.
-`cargo fmt --all` and `cargo test` pass with zero warnings.
+Since R8, a pure-std MySQL v10 frontend is verified against a local TCP mock:
+protocol-10 handshake parsing, HandshakeResponse41 with the native-password
+SHA-1 scramble, OK/ERR/EOF/COM_QUERY result sets, typed MySQL error codes and
+SQLSTATEs, strict sequence ids, size bounds and deprecated-EOF OK packets. No
+real MySQL server was tested. `cargo fmt --all` and `cargo test` pass with zero
+warnings.
 
-Still R8+: SCRAM/MD5/cleartext password authentication in the client,
-prepared statements, binary result decoding, PostgreSQL connection pooling,
-MySQL, migration rollback, ORM relations, real connection pool sizing,
-distributed rate limiting, and a distributed connection coordinator. The
-bundled server is a conformance harness for a small SQL subset, not a
-PostgreSQL replacement; no third-party PostgreSQL server was tested. The TLS
-client has no mTLS, no OCSP/CRL and no revocation checking. `Kv` / `Memory`
-support only the small SQL subset listed above, not arbitrary SQL. `get` /
-`update` / `delete` require a declared primary field; models with zero primary
-fields are parsed but cannot be addressed by id yet. On targets other than
-macOS/Linux the SQLite driver is a documented unavailable stub. MySQL remains
-R8+.
+Still R9+: SCRAM/MD5/cleartext password authentication in the PostgreSQL
+client, caching_sha2_password and TLS negotiation for MySQL, prepared
+statements, binary result decoding, connection pooling, migration rollback,
+ORM relations, real connection pool sizing, distributed rate limiting, and a
+distributed connection coordinator. The bundled PostgreSQL server is a
+conformance harness for a small SQL subset, not a PostgreSQL replacement; no
+third-party PostgreSQL server was tested. The TLS client has no mTLS, no
+OCSP/CRL and no revocation checking. `Kv` / `Memory` support only the small
+SQL subset listed above, not arbitrary SQL. `get` / `update` / `delete` require
+a declared primary field; models with zero primary fields are parsed but cannot
+be addressed by id yet. On targets other than macOS/Linux the SQLite driver is
+a documented unavailable stub. The MySQL driver has no caching_sha2_password,
+no TLS negotiation, no prepared statements, no pooling and no real MySQL
+server test; those remain R9+.
