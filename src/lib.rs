@@ -1,14 +1,16 @@
 //! OPUROM R2 data layer.
 //!
 //! Three interchangeable [`Database`] drivers: [`Sqlite`] (direct FFI to the
-//! macOS system libsqlite3), [`Kv`] (file-backed key/value store) and
-//! [`Memory`] (volatile). IR model definitions drive type-correct CRUD SQL and
-//! deterministic migration files.
+//! macOS/Linux system libsqlite3), [`Kv`] (file-backed key/value store) and
+//! [`Memory`] (volatile). [`PooledDb`] shares one Mutex-serialized `Sqlite`
+//! connection between threads. IR model definitions drive type-correct CRUD
+//! SQL and deterministic migration files.
 
 mod crud;
 mod kv;
 mod memory;
 mod model;
+mod pool;
 mod store;
 
 // The FFI driver links the system libsqlite3. macOS ships it in the SDK;
@@ -27,6 +29,7 @@ pub use model::{
     create_table_sql, migration_files, parse_models, parse_models_value, schema_sql, sql_literal,
     validate_ident, validate_model, write_migrations, Field, FieldType, Model,
 };
+pub use pool::PooledDb;
 pub use sqlite::Sqlite;
 
 use std::fmt;

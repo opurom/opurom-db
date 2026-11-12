@@ -1,9 +1,10 @@
 # opurom-db
 
-R2 data layer for OPUROM: one `Database` trait over three drivers, typed
-IR-driven CRUD helpers, and deterministic SQL migrations. Rust 1.99.1,
-`std` + `serde_json` only. SQLite is reached through direct FFI to the
-system `libsqlite3` (`#[link(name = "sqlite3")]`), with no SQLite crate.
+R2/R4 data layer for OPUROM: one `Database` trait over three drivers, typed
+IR-driven CRUD helpers, deterministic SQL migrations, and an R4 shared SQLite
+handle for generated services. Rust 1.99.1, `std` + `serde_json` only. SQLite
+is reached through direct FFI to the system `libsqlite3`
+(`#[link(name = "sqlite3")]`), with no SQLite crate.
 
 ## Public API
 
@@ -24,6 +25,9 @@ pub trait Database {
 | `open(path) -> Result<Sqlite, DbError>` | free function; identical to `Sqlite::open(path)` |
 | `Sqlite::open(path)` | associated form, same behaviour |
 | `Sqlite::exec_params` / `Sqlite::query_params` | native `?` parameter binding |
+| `PooledDb::open(path) -> Result<PooledDb, DbError>` | one Mutex-serialized SQLite connection |
+| `PooledDb::with(f)` | `f: FnOnce(&mut Sqlite) -> T`, lock held for the whole call |
+| `PooledDb: Clone + Send + Sync` | clones share the same connection |
 | `Kv::open(path)` | file-backed store; `put` / `get` / `delete` / `keys` |
 | `Memory::new()` | volatile store, `Default` implemented |
 | `Value::{Int(i64), Text(String), Bool(bool)}` | `as_i64` / `as_str` / `as_bool` |
@@ -55,6 +59,30 @@ type zero value (`0` / `""` / `false`). An omitted `int` primary key is
 auto-assigned as `max(id) + 1`. Supplied column names are validated against
 the model and the identifier rule `[A-Za-z_][A-Za-z0-9_]*`.
 
+## R4 pooled SQLite handle
+
+```rust
+let pool = PooledDb::open("./opurom.db")?;
+let clone = pool.clone();
+pool.with(|db| db.exec("CREATE TABLE IF NOT EXISTS T (id INTEGER);"))?;
+clone.with(|db| db.query("SELECT * FROM T;"))?;
+```
+
+`Sqlite` owns a raw `sqlite3*` and is deliberately not `Send`. `PooledDb` is
+`Arc<Mutex<Sqlite>>`; it never exposes the owned `Sqlite`, and `with` holds the
+Mutex for the entire `&mut Sqlite` borrow. `Sqlite::open` calls
+`sqlite3_threadsafe()` and rejects a libsqlite3 built without thread-safety.
+On macOS and Linux, `unsafe impl Send` and `unsafe impl Sync` are therefore
+justified by one invariant: all FFI access to the connection is serialized by
+the Mutex. A poisoned Mutex is recovered because the SQLite handle remains
+usable and later calls still hold the same guard.
+
+This is one shared connection, not a sized pool of independent connections. It
+does not add transactions, authentication, TLS, connection pool sizing, or
+distributed coordination. The R4 server-side rate limit and structured request
+log live in `opurom-server` (`OPR_RATE_LIMIT` and `OPR_LOG_JSON`); this crate
+only supplies the shared handle.
+
 ### Type and quoting rules
 
 - IR `int` -> SQL `INTEGER`, `string` -> `TEXT`, `bool` -> `INTEGER` holding
@@ -75,8 +103,8 @@ the model and the identifier rule `[A-Za-z_][A-Za-z0-9_]*`.
 
 ### SQLite (`Sqlite`)
 
-Direct FFI: `sqlite3_open`, `sqlite3_close`, `sqlite3_exec`,
-`sqlite3_prepare_v2`, `sqlite3_step`, `sqlite3_column_*`,
+Direct FFI: `sqlite3_open`, `sqlite3_threadsafe`, `sqlite3_close`,
+`sqlite3_exec`, `sqlite3_prepare_v2`, `sqlite3_step`, `sqlite3_column_*`,
 `sqlite3_finalize`, `sqlite3_errmsg`, `sqlite3_free`, `sqlite3_bind_int64`,
 `sqlite3_bind_text`. `exec` uses `sqlite3_exec` so a whole `schema.sql`
 string can be applied in one call. Prepared statements are finalized on
@@ -134,31 +162,34 @@ empty `models` array produces no numbered migration files (only an empty
 
 The generated server needs no env var and no startup step from this crate.
 It can apply migrations with `db.exec(&schema_sql)` or call
-`create_table(&mut db, &model)` per model at startup.
+`create_table(&mut db, &model)` per model at startup. In R4 the generated
+service opens one `PooledDb` at startup and runs migrations through `with`.
 
 ## Build and tests
 
 ```sh
-cargo fmt
-cargo test
+cargo fmt --all
+cargo test --offline
 ```
 
-Tests cover: SQLite CRUD round-trip against a temp file, native parameter
-binding with quotes, KV persistence across two opens, KV and Memory CRUD,
-migration SQL content and idempotency, malformed IR rejection, SQL injection
-on identifiers, empty-model migrations, the `opurom-migrate` binary, and the
-`Row` / `Value` helpers.
+The 12 tests cover: SQLite CRUD round-trip against a temp file, native
+parameter binding with quotes, KV persistence across two opens, KV and Memory
+CRUD, migration SQL content and idempotency, malformed IR rejection, SQL
+injection on identifiers, empty-model migrations, the `opurom-migrate`
+binary, the `Row` / `Value` helpers, and eight threads sharing one `PooledDb`
+for insert/read/update/delete.
 
-## Honest status (R2)
+## Honest status (R4)
 
-Verified: SQLite via FFI, embedded file-backed KV, in-memory store, typed
-CRUD helpers, deterministic/idempotent migration SQL, identifier validation,
-parameter binding, `opurom-db` library and `opurom-migrate` binary.
+Verified: SQLite via FFI on macOS/Linux, embedded file-backed KV, in-memory
+store, typed CRUD helpers, deterministic/idempotent migration SQL, identifier
+validation, parameter binding, a Mutex-serialized shared SQLite handle with a
+threaded CRUD test, `opurom-db` library and `opurom-migrate` binary.
 
-Not implemented (R3+): PostgreSQL / MySQL drivers, connection pooling,
-transactions, authentication, TLS, migration rollback, and ORM relations.
-The SQLite FFI driver is macOS-only in R2; other platforms get a documented
-unavailable error. `Kv` / `Memory` support only the small SQL subset listed
-above, not arbitrary SQL. `get` / `update` / `delete` require a declared
-primary field; models with zero primary fields are parsed but cannot be
-addressed by id yet.
+Not implemented (R5+): PostgreSQL / MySQL drivers, transactions,
+authentication, TLS, migration rollback, ORM relations, real connection pool
+sizing, distributed rate limiting, and a distributed connection coordinator.
+`Kv` / `Memory` support only the small SQL subset listed above, not arbitrary
+SQL. `get` / `update` / `delete` require a declared primary field; models with
+zero primary fields are parsed but cannot be addressed by id yet. On targets
+other than macOS/Linux the SQLite driver is a documented unavailable stub.
