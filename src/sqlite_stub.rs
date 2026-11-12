@@ -2,7 +2,7 @@
 
 use crate::{Database, DbError, Row, Value};
 
-const UNAVAILABLE: &str = "SQLite FFI is unavailable on this target: opurom-db links the system libsqlite3 only on macOS; use Kv or Memory instead";
+const UNAVAILABLE: &str = "SQLite FFI is unavailable on this target: opurom-db links the system libsqlite3 on macOS and Linux; use Kv or Memory instead";
 
 pub struct Sqlite;
 

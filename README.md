@@ -82,12 +82,14 @@ Direct FFI: `sqlite3_open`, `sqlite3_close`, `sqlite3_exec`,
 string can be applied in one call. Prepared statements are finalized on
 every path, including errors.
 
-The `#[link(name = "sqlite3")]` extern block is compiled only on macOS,
-where the system library is present. On other targets a stub is compiled:
-`Sqlite::open` returns a documented "SQLite FFI is unavailable" `DbError`
-instead of pretending success; use `Kv` or `Memory` there. Verified on this
-host: `/usr/lib/libsqlite3.dylib` is provided through the macOS SDK stub
-(`libsqlite3.tbd`), and tests link and pass with no external crate.
+The `#[link(name = "sqlite3")]` extern block is compiled on macOS and Linux.
+macOS ships the library in the SDK (`libsqlite3.tbd`); on Linux the system
+package `libsqlite3-dev` is required, and CI installs it before the tests.
+On other targets a stub is compiled: `Sqlite::open` returns a documented
+"SQLite FFI is unavailable" `DbError` instead of pretending success; use `Kv`
+or `Memory` there. Verified on this host: `/usr/lib/libsqlite3.dylib` is
+provided through the macOS SDK stub, and tests link and pass with no external
+crate.
 
 ### Embedded KV (`Kv`)
 
