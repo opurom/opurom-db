@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -481,4 +483,71 @@ fn row_builder_and_value_helpers() {
     fn assert_std_error<T: std::error::Error + std::fmt::Debug>() {}
     assert_std_error::<DbError>();
     assert!(format!("{}", DbError::new("oops")).contains("oops"));
+}
+
+#[test]
+fn pooled_db_serializes_crud_across_threads() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<PooledDb>();
+
+    let dir = TempDir::new("pooled-crud");
+    let db_path = dir.path().join("pool.sqlite");
+    let pool = PooledDb::open(db_path.to_str().unwrap()).unwrap();
+    pool.with(|db| {
+        db.exec("CREATE TABLE T (id INTEGER PRIMARY KEY, title TEXT);")
+            .unwrap()
+    });
+
+    const THREADS: i64 = 8;
+    let barrier = Arc::new(Barrier::new(THREADS as usize));
+    let mut handles = Vec::new();
+    for id in 1..=THREADS {
+        let pool = pool.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            pool.with(|db| {
+                let created = format!("t{id}");
+                let updated = format!("u{id}");
+                db.exec_params(
+                    "INSERT INTO T (id, title) VALUES (?, ?);",
+                    &[Value::Int(id), Value::Text(created.clone())],
+                )
+                .unwrap();
+                let rows = db
+                    .query_params("SELECT title FROM T WHERE id = ?;", &[Value::Int(id)])
+                    .unwrap();
+                assert_eq!(
+                    rows[0].get("title").unwrap().as_str(),
+                    Some(created.as_str())
+                );
+
+                db.exec_params(
+                    "UPDATE T SET title = ? WHERE id = ?;",
+                    &[Value::Text(updated.clone()), Value::Int(id)],
+                )
+                .unwrap();
+                let rows = db
+                    .query_params("SELECT title FROM T WHERE id = ?;", &[Value::Int(id)])
+                    .unwrap();
+                assert_eq!(
+                    rows[0].get("title").unwrap().as_str(),
+                    Some(updated.as_str())
+                );
+
+                db.exec_params("DELETE FROM T WHERE id = ?;", &[Value::Int(id)])
+                    .unwrap();
+                let rows = db
+                    .query_params("SELECT title FROM T WHERE id = ?;", &[Value::Int(id)])
+                    .unwrap();
+                assert!(rows.is_empty());
+            });
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let rows = pool.with(|db| db.query("SELECT COUNT(*) AS n FROM T;").unwrap());
+    assert_eq!(rows[0].get("n"), Some(&Value::Int(0)));
 }

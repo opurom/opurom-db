@@ -16,6 +16,7 @@ const SQLITE_NULL: c_int = 5;
 #[link(name = "sqlite3")]
 unsafe extern "C" {
     fn sqlite3_open(filename: *const c_char, db: *mut *mut c_void) -> c_int;
+    fn sqlite3_threadsafe() -> c_int;
     fn sqlite3_close(db: *mut c_void) -> c_int;
     fn sqlite3_exec(
         db: *mut c_void,
@@ -122,6 +123,13 @@ type BoundText = Vec<Option<CString>>;
 
 impl Conn {
     fn open(path: &str) -> Result<Conn, DbError> {
+        // PooledDb may move this connection between threads; refuse builds
+        // where SQLite cannot be used with a serialized mutex.
+        if unsafe { sqlite3_threadsafe() } == 0 {
+            return Err(DbError::new(
+                "sqlite3 was built without thread-safety; use Kv or Memory instead",
+            ));
+        }
         let cpath = cstring(path, "database path")?;
         let mut db = ptr::null_mut();
         let rc = unsafe { sqlite3_open(cpath.as_ptr(), &mut db) };
