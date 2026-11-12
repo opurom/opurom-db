@@ -1,7 +1,8 @@
-//! OPUROM R2 data layer.
+//! OPUROM R2/R5 data layer.
 //!
-//! Three interchangeable [`Database`] drivers: [`Sqlite`] (direct FFI to the
-//! macOS/Linux system libsqlite3), [`Kv`] (file-backed key/value store) and
+//! Four interchangeable [`Database`] drivers: [`Sqlite`] (direct FFI to the
+//! macOS/Linux system libsqlite3), [`PgConnection`] (pure-std PostgreSQL v3
+//! simple-query TCP frontend), [`Kv`] (file-backed key/value store) and
 //! [`Memory`] (volatile). [`PooledDb`] shares one Mutex-serialized `Sqlite`
 //! connection between threads. IR model definitions drive type-correct CRUD
 //! SQL and deterministic migration files.
@@ -10,6 +11,7 @@ mod crud;
 mod kv;
 mod memory;
 mod model;
+mod pg;
 mod pool;
 mod store;
 
@@ -29,6 +31,7 @@ pub use model::{
     create_table_sql, migration_files, parse_models, parse_models_value, schema_sql, sql_literal,
     validate_ident, validate_model, write_migrations, Field, FieldType, Model,
 };
+pub use pg::PgConnection;
 pub use pool::PooledDb;
 pub use sqlite::Sqlite;
 

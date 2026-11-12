@@ -1,10 +1,11 @@
 # opurom-db
 
-R2/R4 data layer for OPUROM: one `Database` trait over three drivers, typed
-IR-driven CRUD helpers, deterministic SQL migrations, and an R4 shared SQLite
-handle for generated services. Rust 1.99.1, `std` + `serde_json` only. SQLite
-is reached through direct FFI to the system `libsqlite3`
-(`#[link(name = "sqlite3")]`), with no SQLite crate.
+R2/R4/R5 data layer for OPUROM: one `Database` trait over four drivers, typed
+IR-driven CRUD helpers, deterministic SQL migrations, an R4 shared SQLite
+handle, and an R5 pure-std PostgreSQL v3 frontend. Rust 1.99.1,
+`std` + `serde_json` only; PostgreSQL uses plain `std::net::TcpStream` and
+no new crate. SQLite is reached through direct FFI to the system
+`libsqlite3` (`#[link(name = "sqlite3")]`), with no SQLite crate.
 
 ## Public API
 
@@ -14,7 +15,7 @@ pub trait Database {
     fn query(&mut self, sql: &str) -> Result<Vec<Row>, DbError>;
 
     // Default methods. SQLite overrides these with real sqlite3_bind_* calls;
-    // Kv/Memory substitute safely quoted literals.
+    // Kv/Memory/PgConnection substitute safely quoted literals.
     fn exec_params(&mut self, sql: &str, params: &[Value]) -> Result<(), DbError>;
     fn query_params(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError>;
 }
@@ -22,6 +23,9 @@ pub trait Database {
 
 | Item | Notes |
 | --- | --- |
+| `PgConnection::connect(host, port, user, database)` | plain TCP v3 startup; requires `AuthenticationOk` |
+| `PgConnection::exec` / `query` | simple `Query`; implements `Database` for CRUD routing |
+| `PgConnection::parameter(name)` / `backend_key()` | parsed startup `ParameterStatus` / `BackendKeyData` |
 | `open(path) -> Result<Sqlite, DbError>` | free function; identical to `Sqlite::open(path)` |
 | `Sqlite::open(path)` | associated form, same behaviour |
 | `Sqlite::exec_params` / `Sqlite::query_params` | native `?` parameter binding |
@@ -32,7 +36,7 @@ pub trait Database {
 | `Memory::new()` | volatile store, `Default` implemented |
 | `Value::{Int(i64), Text(String), Bool(bool)}` | `as_i64` / `as_str` / `as_bool` |
 | `Row::get(&str) -> Option<&Value>` | plus `Row::new()`, `insert`, `set`, `columns`, `len`, `is_empty` |
-| `DbError` | `Display`, `Debug`, `std::error::Error`; carries the sqlite errmsg |
+| `DbError` | `Display`, `Debug`, `std::error::Error`; carries a readable driver message |
 
 `Row::insert(name, value)` works both in place (`let mut r = Row::new();
 r.insert(...);`) and as a builder (`Row::new().insert(...).insert(...)`);
@@ -119,6 +123,39 @@ or `Memory` there. Verified on this host: `/usr/lib/libsqlite3.dylib` is
 provided through the macOS SDK stub, and tests link and pass with no external
 crate.
 
+### PostgreSQL v3 (`PgConnection`)
+
+`PgConnection::connect("127.0.0.1", 5432, "user", "database")` sends a
+protocol-196608 startup message (`user`, `database`) over plain TCP, parses
+`AuthenticationOk`, `ParameterStatus`, `BackendKeyData` and `ReadyForQuery`,
+and rejects `ErrorResponse` as a readable `DbError`. Cleartext, MD5 and
+SASL/SCRAM authentication requests return an `UNSUPPORTED` error; no
+credentials are sent and success is never faked.
+
+`query(sql)` sends one simple `Query` message and parses
+`RowDescription`, `DataRow`, `CommandComplete` and `ReadyForQuery` until the
+connection is ready. Repeated command sequences in one simple-query string
+are accepted; rows from every result set are appended. `exec(sql)` discards
+the rows. Both implement `Database`, so `create_table`, `create`, `list`,
+`get`, `update` and `delete` route to PostgreSQL when their generated SQL is
+compatible. Generated `INTEGER`/`TEXT`/`INTEGER DEFAULT 0|1` columns and
+client-assigned integer primary keys are compatible; PostgreSQL's
+`INTEGER PRIMARY KEY` does not auto-increment, so callers must use the CRUD
+helpers or supply an id. Trait-default `?` placeholders are substituted as
+safely quoted literals, not native PostgreSQL `$1` parameters.
+
+Text-format int OIDs become `Value::Int`, PostgreSQL bool `t`/`f` becomes
+`Value::Bool`, and other types become `Value::Text`; SQL NULL is omitted.
+Binary-format columns are rejected. Duplicate column names collapse in
+`Row`. Floats, numerics, dates, arrays and JSON have no dedicated `Value`
+variant and are returned as text. There is no TLS, no password or
+SCRAM/MD5 authentication, no prepared statements, no connection pooling, no
+transaction API, no COPY protocol and no binary result decoding. A 500 ms
+per-address connect timeout, write deadline and response deadline, a 16 MiB
+frame and cumulative response budget, a 65,536-row cap and a 1,600-column
+cap bound memory and waiting. No real PostgreSQL server was tested;
+`tests/pg_protocol.rs` uses a loopback mock server only.
+
 ### Embedded KV (`Kv`)
 
 A UTF-8 file of newline-delimited `key<TAB>value` lines. `put` performs an
@@ -172,24 +209,42 @@ cargo fmt --all
 cargo test --offline
 ```
 
-The 12 tests cover: SQLite CRUD round-trip against a temp file, native
-parameter binding with quotes, KV persistence across two opens, KV and Memory
-CRUD, migration SQL content and idempotency, malformed IR rejection, SQL
-injection on identifiers, empty-model migrations, the `opurom-migrate`
-binary, the `Row` / `Value` helpers, and eight threads sharing one `PooledDb`
-for insert/read/update/delete.
+All 12 R4 integration tests remain green: SQLite CRUD round-trip against a
+temp file, native parameter binding with quotes, KV persistence across two
+opens, KV and Memory CRUD, migration SQL content and idempotency, malformed
+IR rejection, SQL injection on identifiers, empty-model migrations, the
+`opurom-migrate` binary, the `Row` / `Value` helpers, and eight threads
+sharing one `PooledDb` for insert/read/update/delete.
 
-## Honest status (R4)
+Six R5 tests in `tests/pg_protocol.rs` cover a loopback mock server: startup
+and `Query` framing, `ParameterStatus` / `BackendKeyData` parsing, a two-row
+result with typed values and SQL NULL omission, CRUD routing through the
+`Database` trait, query/startup `ErrorResponse` rejection, startup/query
+truncation, invalid and oversized frame lengths, read timeout, and
+unsupported cleartext/MD5/SASL authentication. `cargo test --offline`
+therefore runs 18 integration tests (0 unit tests, 0 doc tests). R5 sockets
+bind to `127.0.0.1` on ephemeral ports and every mock thread is joined; no
+external PostgreSQL server is contacted and no server process is left
+running.
+
+## Honest status (R5)
 
 Verified: SQLite via FFI on macOS/Linux, embedded file-backed KV, in-memory
 store, typed CRUD helpers, deterministic/idempotent migration SQL, identifier
 validation, parameter binding, a Mutex-serialized shared SQLite handle with a
-threaded CRUD test, `opurom-db` library and `opurom-migrate` binary.
+threaded CRUD test, `opurom-db` library and `opurom-migrate` binary. Also
+verified against a local TCP mock: PostgreSQL v3 startup and simple-query
+framing, typed text rows, readable errors, unsupported-auth rejection,
+size/time bounds, and `Database` trait routing. `cargo fmt --all` and
+`cargo test --offline` pass with zero warnings.
 
-Not implemented (R5+): PostgreSQL / MySQL drivers, transactions,
-authentication, TLS, migration rollback, ORM relations, real connection pool
-sizing, distributed rate limiting, and a distributed connection coordinator.
+Still R6+: TLS, SCRAM/MD5/cleartext password authentication, prepared
+statements, binary result decoding, PostgreSQL connection pooling, real
+PostgreSQL server conformance, MySQL, transactions, migration rollback, ORM
+relations, real connection pool sizing, distributed rate limiting, and a
+distributed connection coordinator. No real PostgreSQL server was tested.
 `Kv` / `Memory` support only the small SQL subset listed above, not arbitrary
 SQL. `get` / `update` / `delete` require a declared primary field; models with
 zero primary fields are parsed but cannot be addressed by id yet. On targets
 other than macOS/Linux the SQLite driver is a documented unavailable stub.
+MySQL remains R6+.
