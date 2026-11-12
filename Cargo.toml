@@ -1,0 +1,16 @@
+[package]
+name = "opurom-db"
+version = "0.1.0"
+edition = "2021"
+description = "OPUROM R2 data layer: SQLite FFI, embedded KV, in-memory store, IR migrations"
+
+[lib]
+name = "opurom_db"
+path = "src/lib.rs"
+
+[[bin]]
+name = "opurom-migrate"
+path = "src/bin/opurom-migrate.rs"
+
+[dependencies]
+serde_json = "1"
