@@ -37,7 +37,7 @@ pub use model::{
     validate_ident, validate_model, write_migrations, Field, FieldType, Model,
 };
 pub use mysql::{MySqlConnection, MySqlStatement};
-pub use pg::PgConnection;
+pub use pg::{PgConnection, PgNotification};
 pub use pgserver::{PgAuth, PgServer, PgServerOptions, PgTls};
 pub use pool::PooledDb;
 pub use sqlite::Sqlite;

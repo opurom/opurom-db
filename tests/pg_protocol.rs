@@ -1,4 +1,6 @@
-use opurom_db::{create_table, list, parse_models, Model, PgConnection, Row, Value};
+use opurom_db::{
+    create_table, list, parse_models, Model, PgConnection, PgNotification, Row, Value,
+};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -582,4 +584,71 @@ fn postgres_cleartext_md5_and_sasl_auth_are_unsupported() {
         assert!(message.contains(expected), "{message}");
         server.finish();
     }
+}
+
+fn notification_body(process_id: i32, channel: &str, payload: &str) -> Vec<u8> {
+    let mut body = process_id.to_be_bytes().to_vec();
+    body.extend_from_slice(&cstr(channel));
+    body.extend_from_slice(&cstr(payload));
+    body
+}
+
+#[test]
+fn postgres_notifications_are_buffered_not_rejected() {
+    let listen_reply = join(vec![
+        command_complete("LISTEN"),
+        msg(b'A', &notification_body(4242, "events", "todo:1")),
+        msg(b'A', &notification_body(4242, "events", "")),
+        ready(),
+    ]);
+    let select_reply = join(vec![
+        row_description(),
+        data_row(&[Some("1"), Some("O'Reilly"), Some("t")]),
+        command_complete("SELECT 1"),
+        ready(),
+    ]);
+    let server = MockServer::spawn(
+        startup_success(),
+        vec![reply(listen_reply), reply(select_reply)],
+    );
+    let address = server.address();
+    let (rows, first, second) = bounded("postgres notification client", move || {
+        let mut db = PgConnection::connect("127.0.0.1", address.port(), "alice", "opurom")
+            .expect("startup must succeed");
+        db.exec("LISTEN events;")
+            .expect("LISTEN must survive a notification");
+        let first = db.notifications();
+        let rows = db.query("SELECT * FROM todo;").expect("query after notify");
+        let second = db.notifications();
+        (rows, first, second)
+    });
+    server.finish();
+
+    assert_eq!(
+        first,
+        vec![
+            PgNotification {
+                process_id: 4242,
+                channel: "events".to_string(),
+                payload: "todo:1".to_string(),
+            },
+            PgNotification {
+                process_id: 4242,
+                channel: "events".to_string(),
+                payload: String::new(),
+            },
+        ]
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0],
+        Row::new()
+            .insert("id", Value::Int(1))
+            .insert("title", Value::Text("O'Reilly".to_string()))
+            .insert("done", Value::Bool(true))
+    );
+    assert!(
+        second.is_empty(),
+        "a drained connection holds no stale notifications"
+    );
 }
