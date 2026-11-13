@@ -33,6 +33,7 @@ pub trait Database {
 | `PgConnection::connect_tls(host, port, user, database, server_name, trust)` | TLS 1.2/1.3 before the startup message; `trust` is an explicit DER trust anchor |
 | `PgConnection::exec` / `query` | simple `Query`; implements `Database` for CRUD routing |
 | `PgConnection::parameter(name)` / `backend_key()` | parsed startup `ParameterStatus` / `BackendKeyData` |
+| `PgConnection::cancel(host, port)` | out-of-band `CancelRequest` built from the startup `BackendKeyData` |
 | `PgConnection::tls_version()` | negotiated TLS version (`Some("TLSv1.3")`), `None` on a plain connection |
 | `MySqlConnection::connect(host, port, user, password, database)` | protocol 10 handshake; `mysql_native_password` and `caching_sha2_password` |
 | `MySqlConnection::exec` / `query` | `COM_QUERY`; implements `Database` for CRUD routing |
@@ -149,6 +150,13 @@ protocol-196608 startup message (`user`, `database`) over plain TCP, parses
 and rejects `ErrorResponse` as a readable `DbError`. Cleartext, MD5 and
 SASL/SCRAM authentication requests return an `UNSUPPORTED` error; no
 credentials are sent and success is never faked.
+
+`cancel(host, port)` sends a 16-byte `CancelRequest` on a separate TCP
+connection using the `(process id, secret key)` from `BackendKeyData`. The
+frame carries the length 16, the request code 80877102 and both key values in
+network byte order; PostgreSQL accepts cancellation out of band and sends no
+reply. The query connection stays usable. When the startup sequence omitted
+`BackendKeyData`, `cancel` returns a `DbError` before opening a socket.
 
 `query(sql)` sends one simple `Query` message and parses
 `RowDescription`, `DataRow`, `CommandComplete` and `ReadyForQuery` until the
@@ -343,19 +351,21 @@ cargo fmt --all
 cargo test
 ```
 
-Twelve integration tests cover the core: SQLite CRUD round-trip against a
+Fourteen integration tests cover the core: SQLite CRUD round-trip against a
 temp file, native parameter binding with quotes, KV persistence across two
 opens, KV and Memory CRUD, migration SQL content and idempotency, malformed
 IR rejection, SQL injection on identifiers, empty-model migrations, the
 `opurom-migrate` binary, the `Row` / `Value` helpers, and eight threads
 sharing one `PooledDb` for insert/read/update/delete.
 
-Six tests in `tests/pg_protocol.rs` cover a loopback mock server: startup
+Eight tests in `tests/pg_protocol.rs` cover a loopback mock server: startup
 and `Query` framing, `ParameterStatus` / `BackendKeyData` parsing, a two-row
 result with typed values and SQL NULL omission, CRUD routing through the
 `Database` trait, query/startup `ErrorResponse` rejection, startup/query
-truncation, invalid and oversized frame lengths, read timeout, and
-unsupported cleartext/MD5/SASL authentication.
+truncation, invalid and oversized frame lengths, read timeout, unsupported
+cleartext/MD5/SASL authentication, an exact 16-byte `CancelRequest` on a
+separate socket with the query connection still usable, and cancellation
+rejection when startup omitted `BackendKeyData`.
 
 Eleven tests in `tests/pgserver.rs` run the client against the bundled
 server over real sockets: a multi-statement `BEGIN` / `INSERT` / `SELECT` /
@@ -383,8 +393,8 @@ SHA-256 known-answer vectors, the native-password scramble, the real MySQL 8.0
 fast-auth scramble, a deterministic RSA-OAEP ciphertext, and bounded statement
 framing.
 
-`cargo test --offline` runs 43 integration tests, 8 unit tests and 0 doc
-tests (51 total). `cargo fmt --all` and
+`cargo test --offline` runs 47 integration tests, 8 unit tests and 0 doc
+tests (55 total). `cargo fmt --all` and
 `RUSTFLAGS="-D warnings" cargo test --offline` pass with zero warnings. Sockets
 bind to `127.0.0.1` on ephemeral ports and every server runs on background
 threads of the test process, so no external PostgreSQL or MySQL server is

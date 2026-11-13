@@ -1,10 +1,11 @@
 //! Pure-std PostgreSQL v3 frontend.
 //!
-//! This driver speaks plain TCP startup and simple `Query` messages only. It
-//! accepts `AuthenticationOk` and rejects any other authentication request,
-//! binary result columns, oversized frames and slow or truncated responses.
-//! [`PgConnection::connect_tls`] adds a rustls TLS 1.2/1.3 transport that
-//! negotiates the encrypted session before the startup message.
+//! This driver speaks plain TCP startup, simple `Query` messages and
+//! out-of-band `CancelRequest` frames only. It accepts `AuthenticationOk` and
+//! rejects any other authentication request, binary result columns, oversized
+//! frames and slow or truncated responses. [`PgConnection::connect_tls`] adds a
+//! rustls TLS 1.2/1.3 transport that negotiates the encrypted session before
+//! the startup message.
 
 use crate::{Database, DbError, Row, Value};
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -36,6 +37,7 @@ const OID_INT4: i32 = 23;
 const OID_OID: i32 = 26;
 
 const SSL_REQUEST_CODE: i32 = 80_877_103;
+const CANCEL_REQUEST_CODE: i32 = 80_877_102;
 
 /// The encrypted or plain transport carrying the PostgreSQL protocol bytes.
 #[derive(Debug)]
@@ -228,6 +230,21 @@ impl PgConnection {
     /// Return the `(process id, secret key)` from `BackendKeyData`.
     pub fn backend_key(&self) -> Option<(i32, i32)> {
         self.backend_key
+    }
+
+    /// Send an out-of-band `CancelRequest` for this connection's backend.
+    ///
+    /// PostgreSQL accepts the cancel key on a fresh socket rather than the
+    /// query connection, so the frame is written to a separate connection.
+    pub fn cancel(&self, host: &str, port: u16) -> Result<(), DbError> {
+        let (process_id, secret_key) = self
+            .backend_key
+            .ok_or_else(|| DbError::new("postgres server sent no BackendKeyData cancel key"))?;
+        let mut stream = connect_stream(host, port)?;
+        stream
+            .write_all(&cancel_request(process_id, secret_key))
+            .map_err(|error| io_failure("CancelRequest write", error))?;
+        Ok(())
     }
 
     /// The negotiated TLS version, or `None` on a plain connection.
@@ -662,6 +679,15 @@ fn ssl_request() -> Vec<u8> {
     let mut frame = Vec::with_capacity(8);
     frame.extend_from_slice(&8i32.to_be_bytes());
     frame.extend_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
+    frame
+}
+
+fn cancel_request(process_id: i32, secret_key: i32) -> [u8; 16] {
+    let mut frame = [0u8; 16];
+    frame[..4].copy_from_slice(&16i32.to_be_bytes());
+    frame[4..8].copy_from_slice(&CANCEL_REQUEST_CODE.to_be_bytes());
+    frame[8..12].copy_from_slice(&process_id.to_be_bytes());
+    frame[12..16].copy_from_slice(&secret_key.to_be_bytes());
     frame
 }
 
