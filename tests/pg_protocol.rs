@@ -156,6 +156,23 @@ fn bounded<T: Send + 'static>(label: &str, task: impl FnOnce() -> T + Send + 'st
     }
 }
 
+fn accept_with_deadline(listener: &TcpListener) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                return stream;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "no connection arrived in time");
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => panic!("accept failed: {error}"),
+        }
+    }
+}
+
 fn msg(tag: u8, body: &[u8]) -> Vec<u8> {
     let length = (4 + body.len()) as i32;
     let mut frame = Vec::with_capacity(5 + body.len());
@@ -475,6 +492,74 @@ fn postgres_read_timeout_never_hangs() {
         started.elapsed() < Duration::from_secs(4),
         "client must not hang"
     );
+    server.finish();
+}
+
+#[test]
+fn postgres_cancel_request_uses_the_backend_key() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let mut session = accept_with_deadline(&listener);
+        session
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        session
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let startup = read_startup_frame(&mut session).unwrap();
+        session.write_all(&startup_success()).unwrap();
+        let mut cancel = accept_with_deadline(&listener);
+        cancel
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut frame = [0u8; 16];
+        cancel.read_exact(&mut frame).unwrap();
+        let query = read_query_frame(&mut session).unwrap();
+        session.write_all(&exec_reply()).unwrap();
+        (startup, query, frame)
+    });
+    let port = address.port();
+    bounded("postgres cancel client", move || {
+        let mut db = PgConnection::connect("127.0.0.1", port, "alice", "opurom")
+            .expect("startup must succeed");
+        assert_eq!(db.backend_key(), Some((4242, 99)));
+        db.cancel("127.0.0.1", port)
+            .expect("CancelRequest must be written");
+        db.exec("SELECT 1;")
+            .expect("query connection stays usable after cancellation");
+    });
+    let (startup, query, frame) = server.join().expect("cancel server thread panicked");
+    assert_eq!(
+        startup_parameters(&startup),
+        vec![
+            ("user".to_string(), "alice".to_string()),
+            ("database".to_string(), "opurom".to_string()),
+        ]
+    );
+    assert_eq!(query_sql(&query), "SELECT 1;");
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&16i32.to_be_bytes());
+    expected.extend_from_slice(&80_877_102i32.to_be_bytes());
+    expected.extend_from_slice(&4242i32.to_be_bytes());
+    expected.extend_from_slice(&99i32.to_be_bytes());
+    assert_eq!(frame.to_vec(), expected);
+}
+
+#[test]
+fn postgres_cancel_without_backend_key_is_rejected() {
+    let startup = join(vec![msg(b'R', &0i32.to_be_bytes()), ready()]);
+    let server = MockServer::spawn(startup, Vec::new());
+    let address = server.address();
+    let error = bounded("postgres cancel without key client", move || {
+        let db = PgConnection::connect("127.0.0.1", address.port(), "alice", "opurom")
+            .expect("startup must succeed");
+        assert_eq!(db.backend_key(), None);
+        // Port 1 has no listener: a connection attempt would fail instead.
+        db.cancel("127.0.0.1", 1).unwrap_err()
+    });
+    assert!(error.to_string().contains("BackendKeyData"), "{error}");
     server.finish();
 }
 

@@ -217,7 +217,7 @@ fn sqlite_crud_roundtrips_hostile_text_byte_exactly() {
         "back\\slash and NUL-like \\0 \\x00 \\u0000 %00",
         "embedded\0NUL byte and another\0one",
         "question ? marks ?? and 'quoted' text",
-        "non-ASCII: 中文 日本語 한국어 العربية éñü 🧪🚀",
+        "non-ASCII: \u{4e2d}\u{6587} \u{65e5}\u{672c}\u{8a9e} \u{d55c}\u{ad6d}\u{c5b4} \u{627}\u{644}\u{639}\u{631}\u{628}\u{64a}\u{629} \u{e9}\u{f1}\u{fc} \u{1f9ea}\u{1f680}",
         "",
     ];
     for (i, &original) in cases.iter().enumerate() {
