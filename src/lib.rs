@@ -18,6 +18,7 @@ mod pg;
 mod pgserver;
 mod pool;
 mod store;
+mod transaction;
 
 // The FFI driver links the system libsqlite3. macOS ships it in the SDK;
 // Linux needs libsqlite3-dev, which CI installs before the test step.
@@ -40,6 +41,7 @@ pub use pg::PgConnection;
 pub use pgserver::{PgAuth, PgServer, PgServerOptions, PgTls};
 pub use pool::PooledDb;
 pub use sqlite::Sqlite;
+pub use transaction::Transaction;
 
 use std::fmt;
 
@@ -280,6 +282,18 @@ pub trait Database {
     fn query_params(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
         let sql = substitute_params(sql, params)?;
         self.query(&sql)
+    }
+
+    /// Begin an explicit transaction: `BEGIN` is sent now, `COMMIT` /
+    /// `ROLLBACK` run on the returned [`Transaction`] guard, and a guard
+    /// dropped while still open sends `ROLLBACK`. The default works for any
+    /// driver whose `exec` accepts the transaction SQL; `Kv` and `Memory`
+    /// reject `BEGIN` and so fail here with a readable error.
+    fn transaction(&mut self) -> Result<Transaction<'_, Self>, DbError>
+    where
+        Self: Sized,
+    {
+        Transaction::begin(self)
     }
 }
 

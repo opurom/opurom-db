@@ -844,3 +844,105 @@ fn pooled_db_serializes_crud_across_threads() {
     let rows = pool.with(|db| db.query("SELECT COUNT(*) AS n FROM T;").unwrap());
     assert_eq!(rows[0].get("n"), Some(&Value::Int(0)));
 }
+
+#[test]
+fn sqlite_transaction_commit_keeps_rows() {
+    let dir = TempDir::new("tx-commit");
+    let path = dir.path().join("tx.sqlite").to_str().unwrap().to_string();
+    let mut db = Sqlite::open(&path).unwrap();
+    let model = todo_model();
+    create_table(&mut db, &model).unwrap();
+
+    let mut tx = db.transaction().unwrap();
+    let row = create(&mut *tx, &model, &[("title", Value::Text("kept".into()))]).unwrap();
+    let id = row.get("id").unwrap().as_i64().unwrap();
+    assert_eq!(id, 1);
+    assert_eq!(list(&mut *tx, &model).unwrap().len(), 1);
+    tx.commit().unwrap();
+
+    let rows = list(&mut db, &model).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("title"), Some(&Value::Text("kept".into())));
+}
+
+#[test]
+fn sqlite_transaction_rollback_discards_rows() {
+    let dir = TempDir::new("tx-rollback");
+    let path = dir.path().join("tx.sqlite").to_str().unwrap().to_string();
+    let mut db = Sqlite::open(&path).unwrap();
+    let model = todo_model();
+    create_table(&mut db, &model).unwrap();
+
+    let mut tx = db.transaction().unwrap();
+    create(&mut *tx, &model, &[("title", Value::Text("gone".into()))]).unwrap();
+    assert_eq!(list(&mut *tx, &model).unwrap().len(), 1);
+    tx.rollback().unwrap();
+
+    assert!(list(&mut db, &model).unwrap().is_empty());
+}
+
+#[test]
+fn sqlite_transaction_drop_rolls_back_and_keeps_the_driver_usable() {
+    let dir = TempDir::new("tx-drop");
+    let path = dir.path().join("tx.sqlite").to_str().unwrap().to_string();
+    let mut db = Sqlite::open(&path).unwrap();
+    let model = todo_model();
+    create_table(&mut db, &model).unwrap();
+
+    {
+        let mut tx = db.transaction().unwrap();
+        tx.exec("INSERT INTO Todo (id, title, done) VALUES (7, 'abandoned', 0);")
+            .unwrap();
+        assert_eq!(list(&mut *tx, &model).unwrap().len(), 1);
+        // No commit: the guard drop must roll the insert back.
+    }
+
+    assert!(list(&mut db, &model).unwrap().is_empty());
+    // The driver still works after the implicit rollback.
+    let mut tx = db.transaction().unwrap();
+    tx.exec("INSERT INTO Todo (id, title, done) VALUES (7, 'kept', 0);")
+        .unwrap();
+    tx.commit().unwrap();
+    let rows = list(&mut db, &model).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("title"), Some(&Value::Text("kept".into())));
+}
+
+#[test]
+fn sqlite_transaction_failed_commit_still_rolls_back_on_drop() {
+    let dir = TempDir::new("tx-failed-commit");
+    let path = dir.path().join("tx.sqlite").to_str().unwrap().to_string();
+    let mut db = Sqlite::open(&path).unwrap();
+    db.exec("CREATE TABLE T (id INTEGER);").unwrap();
+
+    let mut tx = db.transaction().unwrap();
+    tx.exec("INSERT INTO T (id) VALUES (1);").unwrap();
+    tx.exec("ROLLBACK;").unwrap();
+    // COMMIT now fails because the transaction is no longer active.
+    assert!(tx.commit().is_err());
+
+    let rows = db.query("SELECT * FROM T;").unwrap();
+    assert!(rows.is_empty());
+    // The driver accepts a new transaction afterwards.
+    db.transaction().unwrap().commit().unwrap();
+}
+
+#[test]
+fn sqlite_nested_transaction_begin_is_a_readable_error() {
+    let dir = TempDir::new("tx-nested");
+    let path = dir.path().join("tx.sqlite").to_str().unwrap().to_string();
+    let mut db = Sqlite::open(&path).unwrap();
+    db.exec("CREATE TABLE T (id INTEGER);").unwrap();
+
+    let mut tx = db.transaction().unwrap();
+    let nested_error = match tx.transaction() {
+        Err(e) => e,
+        Ok(_) => panic!("nested BEGIN must fail"),
+    };
+    assert!(
+        nested_error.message().contains("within a transaction"),
+        "expected the driver's nested-BEGIN message"
+    );
+    tx.rollback().unwrap();
+    db.transaction().unwrap().commit().unwrap();
+}
