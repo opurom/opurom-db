@@ -80,6 +80,18 @@ fn todo_model() -> Model {
     parse_models(&todo_ir()).unwrap().pop().unwrap()
 }
 
+fn note_model() -> Model {
+    parse_models(
+        r#"{"ir":"0.1","models":[{"name":"Note","fields":[
+          {"name":"slug","type":"string","primary":true},
+          {"name":"body","type":"string"}
+        ]}]}"#,
+    )
+    .unwrap()
+    .pop()
+    .unwrap()
+}
+
 fn read_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Vec<u8>>) {
         for entry in fs::read_dir(dir).unwrap() {
@@ -187,6 +199,170 @@ fn sqlite_parameter_binding_handles_quotes() {
     assert!(db
         .exec_params("INSERT INTO T (txt) VALUES (?);", &[])
         .is_err());
+}
+
+#[test]
+fn sqlite_crud_roundtrips_hostile_text_byte_exactly() {
+    let dir = TempDir::new("sqlite-bytes");
+    let db_path = dir.path().join("bytes.sqlite");
+    let mut db = Sqlite::open(db_path.to_str().unwrap()).unwrap();
+    let model = todo_model();
+    create_table(&mut db, &model).unwrap();
+
+    let cases = [
+        "single'quote",
+        "double''quote and \"double quotes\"",
+        "semi; DROP TABLE Todo; --",
+        "line1\nline2\r\ttab;",
+        "back\\slash and NUL-like \\0 \\x00 \\u0000 %00",
+        "embedded\0NUL byte and another\0one",
+        "question ? marks ?? and 'quoted' text",
+        "non-ASCII: 中文 日本語 한국어 العربية éñü 🧪🚀",
+        "",
+    ];
+    for (i, &original) in cases.iter().enumerate() {
+        let value = Value::Text(original.to_string());
+        let done = Value::Bool(i % 2 == 0);
+        let row = create(
+            &mut db,
+            &model,
+            &[("title", value.clone()), ("done", done.clone())],
+        )
+        .unwrap();
+        let id = row.get("id").unwrap().as_i64().unwrap();
+        assert_eq!(row.get("title"), Some(&value), "case {i} create");
+
+        let fetched = get(&mut db, &model, id).unwrap().unwrap();
+        assert_eq!(
+            fetched.get("title").unwrap().as_str().unwrap().as_bytes(),
+            original.as_bytes(),
+            "case {i} get"
+        );
+        assert_eq!(fetched.get("done"), Some(&done), "case {i} bool");
+
+        let rows = list(&mut db, &model).unwrap();
+        assert_eq!(rows.len(), 1, "case {i} list");
+        assert_eq!(
+            rows[0].get("title").unwrap().as_str().unwrap().as_bytes(),
+            original.as_bytes(),
+            "case {i} list"
+        );
+
+        let updated = format!("{original}\nupdated; 'x' --");
+        let updated_value = Value::Text(updated.clone());
+        assert!(update(&mut db, &model, id, &[("title", updated_value.clone())]).unwrap());
+        let fetched = get(&mut db, &model, id).unwrap().unwrap();
+        assert_eq!(
+            fetched.get("title"),
+            Some(&updated_value),
+            "case {i} update"
+        );
+        assert_eq!(
+            fetched.get("title").unwrap().as_str().unwrap().as_bytes(),
+            updated.as_bytes(),
+            "case {i} update"
+        );
+
+        assert!(delete(&mut db, &model, id).unwrap());
+        assert!(list(&mut db, &model).unwrap().is_empty(), "case {i} delete");
+    }
+}
+
+#[test]
+fn sqlite_crud_binding_blocks_query_structure_injection() {
+    let dir = TempDir::new("sqlite-inject");
+    let db_path = dir.path().join("inject.sqlite");
+    let mut db = Sqlite::open(db_path.to_str().unwrap()).unwrap();
+    let model = note_model();
+    create_table(&mut db, &model).unwrap();
+    create(
+        &mut db,
+        &model,
+        &[
+            ("slug", Value::Text("a".to_string())),
+            ("body", Value::Text("alpha".to_string())),
+        ],
+    )
+    .unwrap();
+    create(
+        &mut db,
+        &model,
+        &[
+            ("slug", Value::Text("b".to_string())),
+            ("body", Value::Text("beta".to_string())),
+        ],
+    )
+    .unwrap();
+
+    // The crafted key and body are stored as data: neither INSERT nor SELECT
+    // may gain a WHERE clause, a second statement, or a widened OR condition.
+    let attack = "x' OR 1=1; DROP TABLE Note; --";
+    let body_attack = "'); DROP TABLE Note; --";
+    create(
+        &mut db,
+        &model,
+        &[
+            ("slug", Value::Text(attack.to_string())),
+            ("body", Value::Text(body_attack.to_string())),
+        ],
+    )
+    .unwrap();
+    assert_eq!(list(&mut db, &model).unwrap().len(), 3);
+    let found = get(&mut db, &model, attack.to_string()).unwrap().unwrap();
+    assert_eq!(found.get("slug").unwrap().as_str(), Some(attack));
+    assert_eq!(found.get("body").unwrap().as_str(), Some(body_attack));
+
+    assert!(update(
+        &mut db,
+        &model,
+        attack.to_string(),
+        &[("body", Value::Text("changed".to_string()))]
+    )
+    .unwrap());
+    assert_eq!(list(&mut db, &model).unwrap().len(), 3);
+    assert_eq!(
+        get(&mut db, &model, "a")
+            .unwrap()
+            .unwrap()
+            .get("body")
+            .unwrap()
+            .as_str(),
+        Some("alpha")
+    );
+    assert_eq!(
+        get(&mut db, &model, "b")
+            .unwrap()
+            .unwrap()
+            .get("body")
+            .unwrap()
+            .as_str(),
+        Some("beta")
+    );
+    assert!(delete(&mut db, &model, attack.to_string()).unwrap());
+
+    // A payload that is not a stored key matches nothing and cannot mutate or
+    // drop anything, even though it contains a quote, a semicolon and OR 1=1.
+    let payload = "' OR 1=1; DROP TABLE Note; --";
+    assert!(get(&mut db, &model, payload.to_string()).unwrap().is_none());
+    assert!(!update(
+        &mut db,
+        &model,
+        payload.to_string(),
+        &[("body", Value::Text("pwned".to_string()))]
+    )
+    .unwrap());
+    assert!(!delete(&mut db, &model, payload.to_string()).unwrap());
+
+    let rows = list(&mut db, &model).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get("slug").unwrap().as_str(), Some("a"));
+    assert_eq!(rows[0].get("body").unwrap().as_str(), Some("alpha"));
+    assert_eq!(rows[1].get("slug").unwrap().as_str(), Some("b"));
+    assert_eq!(rows[1].get("body").unwrap().as_str(), Some("beta"));
+    let tables = db
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'Note';")
+        .unwrap();
+    assert_eq!(tables.len(), 1, "the table must survive every attempt");
 }
 
 #[test]

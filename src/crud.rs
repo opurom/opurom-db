@@ -1,6 +1,9 @@
+//! CRUD helpers. Runtime values are always sent as bound `?` parameters,
+//! never interpolated into SQL text.
+
 use crate::{
-    create_table_sql, sql_literal, validate_ident, validate_model, Database, DbError, Field,
-    FieldType, Model, Row, Value,
+    create_table_sql, validate_ident, validate_model, Database, DbError, Field, FieldType, Model,
+    Row, Value,
 };
 use std::collections::BTreeSet;
 
@@ -94,15 +97,18 @@ pub fn create<D: Database + ?Sized>(
         .map(|(f, _)| f.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let vals = values
+    let placeholders = vec!["?"; values.len()].join(", ");
+    let params = values
         .iter()
-        .map(|(_, v)| sql_literal(v))
-        .collect::<Vec<_>>()
-        .join(", ");
-    db.exec(&format!(
-        "INSERT INTO {} ({}) VALUES ({});",
-        model.name, cols, vals
-    ))?;
+        .map(|(_, v)| v.clone())
+        .collect::<Vec<Value>>();
+    db.exec_params(
+        &format!(
+            "INSERT INTO {} ({}) VALUES ({});",
+            model.name, cols, placeholders
+        ),
+        &params,
+    )?;
     let mut row = Row::new();
     for (f, v) in &values {
         row.set(f.name.clone(), v.clone());
@@ -125,14 +131,9 @@ pub fn get<D: Database + ?Sized, V: Into<Value>>(
     validate_model(model)?;
     let pk = require_primary(model)?;
     let id = coerce(&id.into(), pk.ty)?;
-    let sql = format!(
-        "SELECT * FROM {} WHERE {} = {};",
-        model.name,
-        pk.name,
-        sql_literal(&id)
-    );
+    let sql = format!("SELECT * FROM {} WHERE {} = ?;", model.name, pk.name);
     Ok(db
-        .query(&sql)?
+        .query_params(&sql, &[id])?
         .into_iter()
         .next()
         .map(|r| normalize(model, r)))
@@ -158,6 +159,7 @@ pub fn update<D: Database + ?Sized, V: Into<Value>>(
         return Ok(true);
     }
     let mut sets = Vec::with_capacity(fields.len());
+    let mut params = Vec::with_capacity(fields.len() + 1);
     for (name, value) in fields {
         let f = model
             .fields
@@ -166,19 +168,19 @@ pub fn update<D: Database + ?Sized, V: Into<Value>>(
             .ok_or_else(|| {
                 DbError::new(format!("unknown column {name:?} in model {:?}", model.name))
             })?;
-        sets.push(format!(
-            "{} = {}",
-            f.name,
-            sql_literal(&coerce(value, f.ty)?)
-        ));
+        sets.push(format!("{} = ?", f.name));
+        params.push(coerce(value, f.ty)?);
     }
-    db.exec(&format!(
-        "UPDATE {} SET {} WHERE {} = {};",
-        model.name,
-        sets.join(", "),
-        pk.name,
-        sql_literal(&id)
-    ))?;
+    params.push(id);
+    db.exec_params(
+        &format!(
+            "UPDATE {} SET {} WHERE {} = ?;",
+            model.name,
+            sets.join(", "),
+            pk.name
+        ),
+        &params,
+    )?;
     Ok(true)
 }
 
@@ -194,11 +196,9 @@ pub fn delete<D: Database + ?Sized, V: Into<Value>>(
     if get(db, model, id.clone())?.is_none() {
         return Ok(false);
     }
-    db.exec(&format!(
-        "DELETE FROM {} WHERE {} = {};",
-        model.name,
-        pk.name,
-        sql_literal(&id)
-    ))?;
+    db.exec_params(
+        &format!("DELETE FROM {} WHERE {} = ?;", model.name, pk.name),
+        &[id],
+    )?;
     Ok(true)
 }
