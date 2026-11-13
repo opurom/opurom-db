@@ -131,6 +131,22 @@ impl Transport {
     }
 }
 
+/// A PostgreSQL `NotificationResponse` delivered on a listening connection.
+///
+/// After `LISTEN channel`, the server pushes one of these whenever another
+/// session issues `NOTIFY channel, 'payload'`. They arrive between query
+/// responses, so the driver buffers them and [`PgConnection::notifications`]
+/// drains them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgNotification {
+    /// The backend process id that issued the `NOTIFY`.
+    pub process_id: i32,
+    /// The channel the `NOTIFY` targeted.
+    pub channel: String,
+    /// The notification payload, empty when `NOTIFY` carried none.
+    pub payload: String,
+}
+
 /// A PostgreSQL v3 connection using the simple query protocol.
 #[derive(Debug)]
 pub struct PgConnection {
@@ -138,6 +154,7 @@ pub struct PgConnection {
     parameters: BTreeMap<String, String>,
     backend_key: Option<(i32, i32)>,
     broken: bool,
+    notifications: Vec<PgNotification>,
 }
 
 impl PgConnection {
@@ -155,6 +172,7 @@ impl PgConnection {
             parameters: BTreeMap::new(),
             backend_key: None,
             broken: false,
+            notifications: Vec::new(),
         };
         connection.write_all_deadline(&startup, Instant::now() + IO_TIMEOUT)?;
         connection.read_startup(Instant::now() + IO_TIMEOUT)?;
@@ -216,6 +234,7 @@ impl PgConnection {
             parameters: BTreeMap::new(),
             backend_key: None,
             broken: false,
+            notifications: Vec::new(),
         };
         connection.write_all_deadline(&startup, Instant::now() + IO_TIMEOUT)?;
         connection.read_startup(Instant::now() + IO_TIMEOUT)?;
@@ -230,6 +249,15 @@ impl PgConnection {
     /// Return the `(process id, secret key)` from `BackendKeyData`.
     pub fn backend_key(&self) -> Option<(i32, i32)> {
         self.backend_key
+    }
+
+    /// Drain the `NotificationResponse` messages received so far.
+    ///
+    /// A connection that has executed `LISTEN channel` collects one entry per
+    /// `NOTIFY` the server delivers while other queries run. Each call empties
+    /// the buffer so a caller sees every notification once.
+    pub fn notifications(&mut self) -> Vec<PgNotification> {
+        std::mem::take(&mut self.notifications)
     }
 
     /// Send an out-of-band `CancelRequest` for this connection's backend.
@@ -408,6 +436,19 @@ impl PgConnection {
                         return self.fail(error.to_string());
                     }
                 }
+                // A listening connection receives notifications between query
+                // replies; buffer them so the query result is unaffected.
+                b'A' => match parse_notification(&message.body) {
+                    Ok(notification) => self.notifications.push(notification),
+                    Err(error) => return self.fail(error.to_string()),
+                },
+                // The server may report a changed run-time parameter mid-query.
+                b'S' => match parse_parameter_status(&message.body) {
+                    Ok((name, value)) => {
+                        self.parameters.insert(name, value);
+                    }
+                    Err(error) => return self.fail(error.to_string()),
+                },
                 b'Z' => {
                     if let Err(error) = parse_ready(&message.body) {
                         return self.fail(error.to_string());
@@ -766,6 +807,19 @@ fn parse_backend_key(body: &[u8]) -> Result<(i32, i32), DbError> {
     let secret_key = cursor.i32()?;
     cursor.done()?;
     Ok((process_id, secret_key))
+}
+
+fn parse_notification(body: &[u8]) -> Result<PgNotification, DbError> {
+    let mut cursor = Cursor::new(body, "NotificationResponse");
+    let process_id = cursor.i32()?;
+    let channel = cursor.cstring()?;
+    let payload = cursor.cstring()?;
+    cursor.done()?;
+    Ok(PgNotification {
+        process_id,
+        channel,
+        payload,
+    })
 }
 
 fn parse_ready(body: &[u8]) -> Result<(), DbError> {
