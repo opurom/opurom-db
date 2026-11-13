@@ -1,14 +1,17 @@
 # opurom-db
 
-R2/R4/R5/R7/R8 data layer for OPUROM: one `Database` trait over five drivers,
+R2/R4/R5/R7/R8/R10 data layer for OPUROM: one `Database` trait over five drivers,
 typed IR-driven CRUD helpers, deterministic SQL migrations, an R4 shared SQLite
 handle, an R5 pure-std PostgreSQL v3 frontend, an R7 TLS client plus a
-bundled PostgreSQL-protocol conformance server, and an R8 pure-std MySQL
-protocol v10 frontend with a pure-Rust SHA-1 `mysql_native_password` response.
+bundled PostgreSQL-protocol conformance server, and an R10 pure-std MySQL
+protocol v10 frontend with `mysql_native_password`, MySQL 8.0
+`caching_sha2_password`, bounded prepared statements and a pure-Rust
+SHA-1/SHA-256/RSA-OAEP crypto helper.
 Rust 1.99.1; PostgreSQL uses `std::net::TcpStream` and, since R7, the pinned
 pure-Rust `rustls` 0.23.46 (no OpenSSL, no C toolchain: the `ring` provider is
 selected explicitly). SQLite is reached through direct FFI to the system
-`libsqlite3` (`#[link(name = "sqlite3")]`), with no SQLite crate.
+`libsqlite3` (`#[link(name = "sqlite3")]`), with no SQLite crate. The MySQL
+protocol and its authentication hashes use only `std`; no new crate was added.
 
 ## Public API
 
@@ -31,8 +34,11 @@ pub trait Database {
 | `PgConnection::exec` / `query` | simple `Query`; implements `Database` for CRUD routing |
 | `PgConnection::parameter(name)` / `backend_key()` | parsed startup `ParameterStatus` / `BackendKeyData` |
 | `PgConnection::tls_version()` | negotiated TLS version (`Some("TLSv1.3")`), `None` on a plain connection |
-| `MySqlConnection::connect(host, port, user, password, database)` | protocol 10 handshake; `mysql_native_password` only |
+| `MySqlConnection::connect(host, port, user, password, database)` | protocol 10 handshake; `mysql_native_password` and `caching_sha2_password` |
 | `MySqlConnection::exec` / `query` | `COM_QUERY`; implements `Database` for CRUD routing |
+| `MySqlConnection::prepare(sql)` | bounded `COM_STMT_PREPARE`; returns a `MySqlStatement` |
+| `MySqlConnection::execute_stmt(statement, params)` | bounded `COM_STMT_EXECUTE`; binary rows are consumed but not decoded |
+| `MySqlStatement` getters | statement id, column/parameter counts and warning count |
 | `MySqlConnection::server_version()` and other handshake getters | parsed server version, connection id, capabilities, charset, status and plugin |
 | `MySqlErrorKind` | typed MySQL error categories: syntax, table not found, duplicate entry, access denied, other |
 | `PgServer::start(PgServerOptions)` | bundled v3 protocol server on an ephemeral loopback port |
@@ -172,31 +178,59 @@ cap bound memory and waiting.
 `MySqlConnection::connect("127.0.0.1", 3306, "user", "secret", "db")`
 parses the protocol-10 initial handshake (server version, connection id,
 auth-plugin-data part 1+2, capability flags, charset and status) and sends a
-HandshakeResponse41 with `mysql_native_password`. SHA-1 is implemented in pure
-Rust and checked against known-answer vectors; the scramble is
-`SHA1(password) XOR SHA1(nonce || SHA1(SHA1(password)))`. `query(sql)` sends
-`COM_QUERY` and parses OK (0x00 or 0xFE with len<9), ERR (error code plus
-SQLSTATE when `CLIENT_PROTOCOL_41`), EOF, the column-count packet, column
-definitions, text rows and the final EOF/OK. Integer columns become
-`Value::Int`, `TINY(1)` `1`/`0` becomes `Value::Bool`, other columns become
-`Value::Text`, and SQL NULL is omitted. An ERR packet becomes a typed
-`DbError`: `mysql_code()` carries 1064/1146/1062/1045 and
-`mysql_error_kind()` maps them to syntax, table not found, duplicate entry or
-access denied; `sqlstate()` carries the five-byte SQLSTATE.
+HandshakeResponse41 for `mysql_native_password` or MySQL 8.0
+`caching_sha2_password`. SHA-1 and SHA-256 are implemented in pure Rust and
+checked against known-answer vectors. The native scramble is
+`SHA1(password) XOR SHA1(nonce || SHA1(SHA1(password)))`; the real MySQL 8.0
+fast-auth scramble is
+`XOR(SHA256(password), SHA256(SHA256(SHA256(password)) || nonce))`. The client
+accepts `AuthMoreData` `0x01 0x03` (fast success) and `0x01 0x04` (full auth).
+For full auth it sends the `0x02` public-key request, reads the SPKI RSA PEM in
+an `AuthMoreData` packet, encrypts the NUL-terminated password (password bytes
+XORed with the 20-byte nonce) with RSA-OAEP using SHA-1/MGF1 and a pure-std
+big-integer modular exponentiation, then sends the ciphertext. The path follows
+MySQL 8.0 semantics; it does not use the simplified R10 prompt formula or
+PKCS#1 v1.5. Auth switches between the two supported plugins are handled;
+unknown plugins and full auth with an empty password return typed
+`UNSUPPORTED` errors. `query(sql)` sends `COM_QUERY` and parses OK (0x00 or
+0xFE with len<9), ERR (error code plus SQLSTATE when `CLIENT_PROTOCOL_41`),
+EOF, the column-count packet, column definitions, text rows and the final
+EOF/OK. Integer columns become `Value::Int`, `TINY(1)` `1`/`0` becomes
+`Value::Bool`, other columns become `Value::Text`, and SQL NULL is omitted. An
+ERR packet becomes a typed `DbError`: `mysql_code()` carries 1064/1146/1062/1045
+and `mysql_error_kind()` maps them to syntax, table not found, duplicate entry
+or access denied; `sqlstate()` carries the five-byte SQLSTATE.
+
+`prepare(sql)` sends `COM_STMT_PREPARE` and parses the prepare-OK header
+(statement id, column/parameter counts and warning count) plus bounded
+parameter/column metadata. `execute_stmt(statement, params)` sends
+`COM_STMT_EXECUTE` with at most 1,024 parameters, at most 64 KiB per encoded
+value and a 1 MiB packet cap; `Value::Int`, `Value::Bool` and `Value::Text`
+are encoded with their binary type codes, a NULL bitmap and a new-parameters
+flag. OK and ERR replies are parsed. For a result set, the client parses the
+column count and column definitions, consumes binary row headers (`0x00` plus
+the NULL bitmap) through EOF/OK, and returns a typed `UNSUPPORTED` error for
+binary value decoding instead of inventing rows. The socket stays synchronized.
 
 The local TCP conformance test in `tests/mysql_protocol.rs` speaks the real
-wire bytes against a mock server on an ephemeral loopback port: successful
-handshake and two-row query, ERR with SQLSTATE, truncated/malformed packets,
-packet-size bounds, sequence-id mismatches, auth failure, unsupported
-`caching_sha2_password`, and `CLIENT_DEPRECATE_EOF` OK packets. No external
-MySQL server is contacted and no server process is left running. A 1 MiB
-packet cap, 16 MiB cumulative response budget, 65,536-row cap, 1,600-column
-cap, strict sequence ids and 500 ms I/O deadlines bound allocations and
-waiting.
+wire bytes against mock servers on ephemeral loopback ports: native handshake
+and two-row query, caching_sha2 fast auth and auth switch, full auth with
+public-key request/PEM/ciphertext and private-key decryption in the test,
+`COM_STMT_PREPARE`/`COM_STMT_EXECUTE`, binary-row `UNSUPPORTED`, ERR with
+SQLSTATE, truncated/malformed packets, packet-size bounds, sequence-id
+mismatches, auth failure, unknown auth plugins, and `CLIENT_DEPRECATE_EOF` OK
+packets. No external MySQL server is contacted and no server process is left
+running. A 1 MiB packet cap, 16 MiB cumulative response budget, 65,536-row cap,
+1,600-column cap, strict sequence ids and 500 ms I/O deadlines bound
+allocations and waiting. The RSA helper accepts 512..2048-bit SPKI keys with
+odd exponents and uses `/dev/urandom` on Unix; its textbook modular
+exponentiation is neither constant-time nor blinded and is not a general
+crypto library.
 
-Honest scope: no caching_sha2_password, no TLS negotiation, no prepared
-statements, no connection pooling, no binary result decoding, no LOCAL INFILE,
-no multi-result sets, and no real MySQL server tested. Those remain R9+.
+Honest scope: no real MySQL server tested, no TLS negotiation or TLS-wrapped
+full-auth key exchange over a real socket, no binary protocol result decoding,
+no connection pooling, no LOCAL INFILE, and no multi-result sets. Those remain
+R11+.
 
 ### TLS client (`PgConnection::connect_tls`)
 
@@ -336,23 +370,28 @@ rejection of an untrusted self-signed certificate, the rejection of a
 certificate that does not chain to the supplied anchor, a plaintext server
 that refuses TLS, and a session that stays usable after a failed statement.
 
-Eight R8 integration tests in `tests/mysql_protocol.rs` speak real MySQL v10
-bytes against a loopback mock server: handshake with the native-password
-scramble, a two-row `COM_QUERY` result, typed ERR/SQLSTATE mapping (1064, 1146,
-1062 and 1045), truncated/malformed packets, packet-size and column-count
-bounds, sequence-id mismatches, auth failure, unsupported
-`caching_sha2_password` and deprecated-EOF OK packets. Four unit tests in
-`src/mysql.rs` check SHA-1 known-answer vectors and the native-password
-scramble vector.
+Fourteen R10 integration tests in `tests/mysql_protocol.rs` speak real MySQL
+v10 bytes against loopback mock servers: the eight R8 cases (handshake with the
+native-password scramble, a two-row `COM_QUERY` result, typed ERR/SQLSTATE
+mapping (1064, 1146, 1062 and 1045), truncated/malformed packets, packet-size
+and column-count bounds, sequence-id mismatches, auth failure and
+deprecated-EOF OK packets) plus unknown-plugin rejection, caching_sha2 fast
+auth, auth switch, RSA-OAEP full auth with private-key decryption in the test,
+bounded `COM_STMT_PREPARE` / `COM_STMT_EXECUTE`, prepare ERR/truncation and
+binary-result `UNSUPPORTED`. Eight unit tests in `src/mysql.rs` check SHA-1 and
+SHA-256 known-answer vectors, the native-password scramble, the real MySQL 8.0
+fast-auth scramble, a deterministic RSA-OAEP ciphertext, and bounded statement
+framing.
 
-All 29 R7 integration tests remain green. `cargo test --offline` therefore runs
-37 integration tests, 4 unit tests and 0 doc tests (41 total). `cargo fmt
---all` and `RUSTFLAGS="-D warnings" cargo test --offline` pass with zero
-warnings. Sockets bind to `127.0.0.1` on ephemeral ports and every server runs
-on background threads of the test process, so no external PostgreSQL or MySQL
-server is contacted and no server process is left running.
+All 41 R9 tests remain green; R10 adds six integration tests and four unit
+tests (10 total). `cargo test --offline` therefore runs 43 integration tests,
+8 unit tests and 0 doc tests (51 total). `cargo fmt --all` and
+`RUSTFLAGS="-D warnings" cargo test --offline` pass with zero warnings. Sockets
+bind to `127.0.0.1` on ephemeral ports and every server runs on background
+threads of the test process, so no external PostgreSQL or MySQL server is
+contacted and no server process is left running.
 
-## Honest status (R8)
+## Honest status (R10)
 
 Verified: SQLite via FFI on macOS/Linux, embedded file-backed KV, in-memory
 store, typed CRUD helpers, deterministic/idempotent migration SQL, identifier
@@ -368,21 +407,32 @@ transaction with commit and rollback, and SQLSTATE-to-`DbError` mapping.
 Since R8, a pure-std MySQL v10 frontend is verified against a local TCP mock:
 protocol-10 handshake parsing, HandshakeResponse41 with the native-password
 SHA-1 scramble, OK/ERR/EOF/COM_QUERY result sets, typed MySQL error codes and
-SQLSTATEs, strict sequence ids, size bounds and deprecated-EOF OK packets. No
-real MySQL server was tested. `cargo fmt --all` and `cargo test` pass with zero
-warnings.
+SQLSTATEs, strict sequence ids, size bounds and deprecated-EOF OK packets.
+Since R10, the same mock verifies MySQL 8.0 `caching_sha2_password` semantics:
+SHA-256 known-answer vectors (`SHA256("abc")` is
+`ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad`), the
+real fast-auth scramble (for password `secret` and nonce `01..14` it is
+`33f3676ed12f11181e3898714922b5fc3aea77f11729a61eaf781b56a306b82b`), fast success, auth switch, and full
+auth with a real RSA-OAEP/SHA-1 public-key exchange whose ciphertext is
+decrypted by the test private key. Bounded `COM_STMT_PREPARE` /
+`COM_STMT_EXECUTE` framing, ERR/truncated replies and a typed binary-result
+`UNSUPPORTED` path are verified too. No real MySQL server was tested.
+`cargo fmt --all` and `cargo test` pass with zero warnings.
 
-Still R9+: SCRAM/MD5/cleartext password authentication in the PostgreSQL
-client, caching_sha2_password and TLS negotiation for MySQL, prepared
-statements, binary result decoding, connection pooling, migration rollback,
-ORM relations, real connection pool sizing, distributed rate limiting, and a
-distributed connection coordinator. The bundled PostgreSQL server is a
+Still R11+: SCRAM/MD5/cleartext password authentication in the PostgreSQL
+client, TLS negotiation and a TLS-wrapped full-auth key exchange over a real
+socket for MySQL, binary result decoding, connection pooling, the full prepared
+statement lifecycle (`COM_STMT_CLOSE`, long data and cursors), migration
+rollback, ORM relations, real connection pool sizing, distributed rate limiting,
+and a distributed connection coordinator. The bundled PostgreSQL server is a
 conformance harness for a small SQL subset, not a PostgreSQL replacement; no
 third-party PostgreSQL server was tested. The TLS client has no mTLS, no
 OCSP/CRL and no revocation checking. `Kv` / `Memory` support only the small
 SQL subset listed above, not arbitrary SQL. `get` / `update` / `delete` require
 a declared primary field; models with zero primary fields are parsed but cannot
 be addressed by id yet. On targets other than macOS/Linux the SQLite driver is
-a documented unavailable stub. The MySQL driver has no caching_sha2_password,
-no TLS negotiation, no prepared statements, no pooling and no real MySQL
-server test; those remain R9+.
+a documented unavailable stub. The MySQL driver has no TLS negotiation, no
+TLS-wrapped full-auth key exchange over a real socket, no binary result
+decoding, no pooling and no real MySQL server test; those remain R11+. The
+pure-std RSA helper is limited to 512..2048-bit SPKI keys, SHA-1/MGF1 OAEP,
+Unix `/dev/urandom`, and non-constant-time textbook modular exponentiation.

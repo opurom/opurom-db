@@ -1,10 +1,12 @@
 //! Pure-std MySQL protocol v10 frontend.
 //!
 //! This driver speaks plain TCP protocol 10, `mysql_native_password`,
-//! `COM_QUERY` and text result sets. It rejects authentication plugin switches,
-//! TLS negotiation, binary/prepared statements and oversized or out-of-sequence
-//! packets instead of guessing.
+//! `caching_sha2_password`, `COM_QUERY`, `COM_STMT_PREPARE` and
+//! `COM_STMT_EXECUTE`. It rejects TLS negotiation, binary result decoding,
+//! connection pooling and oversized or out-of-sequence packets instead of
+//! guessing.
 
+use crate::mysql_crypto::{encrypt_oaep_sha1, parse_spki_pem, sha1, sha256};
 use crate::{Database, DbError, MySqlErrorKind, Row, Value};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -12,8 +14,15 @@ use std::time::{Duration, Instant};
 
 const PROTOCOL_10: u8 = 10;
 const COM_QUERY: u8 = 0x03;
+const COM_STMT_PREPARE: u8 = 0x16;
+const COM_STMT_EXECUTE: u8 = 0x17;
 const NATIVE_PLUGIN: &str = "mysql_native_password";
+const CACHING_PLUGIN: &str = "caching_sha2_password";
 const SCRAMBLE_LEN: usize = 20;
+const AUTH_MORE_DATA: u8 = 0x01;
+const REQUEST_PUBLIC_KEY: u8 = 0x02;
+const FAST_AUTH_SUCCESS: u8 = 0x03;
+const PERFORM_FULL_AUTH: u8 = 0x04;
 
 const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
 const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
@@ -38,11 +47,15 @@ const MYSQL_TYPE_LONG: u8 = 3;
 const MYSQL_TYPE_LONGLONG: u8 = 8;
 const MYSQL_TYPE_INT24: u8 = 9;
 const MYSQL_TYPE_YEAR: u8 = 13;
+const MYSQL_TYPE_STRING: u8 = 0xfe;
 
 const MAX_PACKET_LEN: usize = 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ROWS: usize = 65_536;
 const MAX_COLUMNS: usize = 1_600;
+const MAX_STMT_PARAMS: usize = 1_024;
+const MAX_STMT_VALUE_BYTES: usize = 64 * 1024;
+const MAX_AUTH_PACKETS: usize = 8;
 const MIN_OK_LEN: usize = 7;
 const DEPRECATED_OK_LIMIT: usize = 9;
 const EOF_LEN: usize = 5;
@@ -69,8 +82,35 @@ struct Handshake {
     nonce: [u8; SCRAMBLE_LEN],
 }
 
+/// The identifiers and counts from a `COM_STMT_PREPARE` OK packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MySqlStatement {
+    id: u32,
+    column_count: u16,
+    param_count: u16,
+    warning_count: u16,
+}
+
+impl MySqlStatement {
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    pub fn column_count(&self) -> u16 {
+        self.column_count
+    }
+
+    pub fn param_count(&self) -> u16 {
+        self.param_count
+    }
+
+    pub fn warning_count(&self) -> u16 {
+        self.warning_count
+    }
+}
+
 impl MySqlConnection {
-    /// Connect with a `mysql_native_password` HandshakeResponse41.
+    /// Connect with a HandshakeResponse41 for either supported auth plugin.
     pub fn connect(
         host: &str,
         port: u16,
@@ -93,7 +133,7 @@ impl MySqlConnection {
             sequence,
             broken: false,
         };
-        connection.read_auth_result(&mut budget, deadline)?;
+        connection.read_auth_result(&mut budget, password)?;
         Ok(connection)
     }
 
@@ -147,30 +187,307 @@ impl MySqlConnection {
         self.query(sql).map(|_| ())
     }
 
+    /// Send `COM_STMT_PREPARE` and parse its bounded prepare-OK metadata.
+    pub fn prepare(&mut self, sql: &str) -> Result<MySqlStatement, DbError> {
+        if self.broken {
+            return Err(DbError::new(
+                "mysql connection is unusable after a protocol error",
+            ));
+        }
+        self.run_prepare(sql)
+    }
+
+    /// Send `COM_STMT_EXECUTE`; binary result rows are consumed but not decoded.
+    pub fn execute_stmt(
+        &mut self,
+        statement: MySqlStatement,
+        params: &[Value],
+    ) -> Result<(), DbError> {
+        if self.broken {
+            return Err(DbError::new(
+                "mysql connection is unusable after a protocol error",
+            ));
+        }
+        self.run_stmt_execute(statement, params)
+    }
+
     fn deprecate_eof(&self) -> bool {
         self.capabilities & CLIENT_DEPRECATE_EOF != 0
     }
 
-    fn read_auth_result(&mut self, budget: &mut Budget, deadline: Instant) -> Result<(), DbError> {
-        let payload = self.read_packet(budget, deadline)?;
-        if is_err(&payload) {
-            return self.typed_error(&payload);
+    fn read_auth_result(&mut self, budget: &mut Budget, password: &str) -> Result<(), DbError> {
+        for _ in 0..MAX_AUTH_PACKETS {
+            let payload = self.read_packet(budget, Instant::now() + IO_TIMEOUT)?;
+            if is_err(&payload) {
+                return self.typed_error(&payload);
+            }
+            if is_ok(&payload, self.deprecate_eof()) {
+                return match parse_ok(&payload, self.deprecate_eof()) {
+                    Ok(()) => Ok(()),
+                    Err(error) => self.fail(error.to_string()),
+                };
+            }
+            if is_eof(&payload) {
+                return self.fail("mysql server sent EOF before authentication OK");
+            }
+            if let Some(status) = auth_more_status(&payload) {
+                match status {
+                    FAST_AUTH_SUCCESS => continue,
+                    PERFORM_FULL_AUTH => {
+                        if self.handshake.plugin != CACHING_PLUGIN {
+                            return self.fail(
+                                "UNSUPPORTED: MySQL full authentication is only valid for caching_sha2_password",
+                            );
+                        }
+                        let nonce = self.handshake.nonce;
+                        self.full_auth(password, &nonce, budget)?;
+                        continue;
+                    }
+                    other => {
+                        return self.fail(format!(
+                            "UNSUPPORTED: MySQL AuthMoreData status 0x{other:02x} is not implemented"
+                        ));
+                    }
+                }
+            }
+            if let Some(switch) = parse_auth_switch(&payload)? {
+                let response = match auth_response(&switch.plugin, password, &switch.nonce) {
+                    Ok(response) => response,
+                    Err(error) => return self.fail(error.to_string()),
+                };
+                self.handshake.plugin = switch.plugin;
+                self.handshake.nonce = switch.nonce;
+                self.write_packet(&response, Instant::now() + IO_TIMEOUT)?;
+                continue;
+            }
+            return self.fail("mysql server did not send OK after authentication");
         }
-        if is_ok(&payload, self.deprecate_eof()) {
-            return match parse_ok(&payload, self.deprecate_eof()) {
+        self.fail("mysql authentication exceeded the bounded packet exchange")
+    }
+
+    fn full_auth(
+        &mut self,
+        password: &str,
+        nonce: &[u8; SCRAMBLE_LEN],
+        budget: &mut Budget,
+    ) -> Result<(), DbError> {
+        if password.is_empty() {
+            return self.fail(
+                "UNSUPPORTED: MySQL caching_sha2_password full authentication with an empty password is not implemented",
+            );
+        }
+        self.write_packet(&[REQUEST_PUBLIC_KEY], Instant::now() + IO_TIMEOUT)?;
+        let key_packet = self.read_packet(budget, Instant::now() + IO_TIMEOUT)?;
+        if is_err(&key_packet) {
+            return self.typed_error(&key_packet);
+        }
+        let mut pem = if key_packet.starts_with(b"-----BEGIN") {
+            key_packet
+        } else if key_packet.first() == Some(&AUTH_MORE_DATA) && key_packet.len() > 1 {
+            key_packet[1..].to_vec()
+        } else {
+            return self.fail("mysql server did not send an AuthMoreData RSA public-key PEM");
+        };
+        while pem.last() == Some(&0) {
+            pem.pop();
+        }
+        let key = match parse_spki_pem(&pem) {
+            Ok(key) => key,
+            Err(error) => return self.fail(rsa_error(error)),
+        };
+        let message = full_auth_message(password, nonce);
+        let ciphertext = match encrypt_oaep_sha1(&key, &message) {
+            Ok(ciphertext) => ciphertext,
+            Err(error) => return self.fail(rsa_error(error)),
+        };
+        self.write_packet(&ciphertext, Instant::now() + IO_TIMEOUT)?;
+        Ok(())
+    }
+
+    fn start_command(&mut self, payload: &[u8], deadline: Instant) -> Result<Budget, DbError> {
+        self.sequence = 0;
+        self.write_packet(payload, deadline)?;
+        Ok(Budget::default())
+    }
+
+    fn run_prepare(&mut self, sql: &str) -> Result<MySqlStatement, DbError> {
+        if sql.as_bytes().contains(&0) {
+            return Err(DbError::new("mysql SQL contains a NUL byte"));
+        }
+        let mut payload = Vec::with_capacity(sql.len() + 1);
+        payload.push(COM_STMT_PREPARE);
+        payload.extend_from_slice(sql.as_bytes());
+        let deadline = Instant::now() + IO_TIMEOUT;
+        let mut budget = self.start_command(&payload, deadline)?;
+        let first = self.read_packet(&mut budget, deadline)?;
+        if is_err(&first) {
+            return self.typed_error(&first);
+        }
+        let statement = match parse_prepare_ok(&first) {
+            Ok(statement) => statement,
+            Err(error) => return self.fail(error.to_string()),
+        };
+        self.read_metadata(
+            usize::from(statement.param_count),
+            "parameter",
+            &mut budget,
+            deadline,
+        )?;
+        self.read_metadata(
+            usize::from(statement.column_count),
+            "column",
+            &mut budget,
+            deadline,
+        )?;
+        Ok(statement)
+    }
+
+    fn run_stmt_execute(
+        &mut self,
+        statement: MySqlStatement,
+        params: &[Value],
+    ) -> Result<(), DbError> {
+        let payload = build_stmt_execute(statement, params)?;
+        let deadline = Instant::now() + IO_TIMEOUT;
+        let mut budget = self.start_command(&payload, deadline)?;
+        let first = self.read_packet(&mut budget, deadline)?;
+        if is_err(&first) {
+            return self.typed_error(&first);
+        }
+        if is_ok(&first, self.deprecate_eof()) {
+            return match parse_ok(&first, self.deprecate_eof()) {
                 Ok(()) => Ok(()),
                 Err(error) => self.fail(error.to_string()),
             };
         }
-        if is_eof(&payload) {
-            return self.fail("mysql server sent EOF before authentication OK");
+        if is_eof(&first) {
+            return self.fail("mysql server sent EOF instead of a COM_STMT_EXECUTE response");
         }
-        if let Some(plugin) = auth_switch_plugin(&payload) {
-            return self.fail(format!(
-                "UNSUPPORTED: MySQL authentication switch to {plugin:?} is not implemented"
-            ));
+        if auth_switch_plugin(&first).is_some() {
+            return self.fail(
+                "UNSUPPORTED: MySQL authentication switches during COM_STMT_EXECUTE are not implemented",
+            );
         }
-        self.fail("mysql server did not send OK after authentication")
+        let columns = self.read_result_columns(&first, &mut budget, deadline)?;
+        let null_bitmap_len = columns
+            .len()
+            .checked_add(9)
+            .ok_or_else(|| DbError::new("mysql binary row column count overflow"))?
+            / 8;
+        let mut saw_binary_row = false;
+        loop {
+            let packet = self.read_packet(&mut budget, deadline)?;
+            if is_err(&packet) {
+                return self.typed_error(&packet);
+            }
+            if is_eof(&packet) {
+                if let Err(error) = parse_eof(&packet) {
+                    return self.fail(error.to_string());
+                }
+                break;
+            }
+            if is_deprecated_ok(&packet, self.deprecate_eof()) {
+                if let Err(error) = parse_ok(&packet, self.deprecate_eof()) {
+                    return self.fail(error.to_string());
+                }
+                break;
+            }
+            if packet.first() != Some(&0x00) || packet.len() <= 1 + null_bitmap_len {
+                return self.fail("malformed mysql binary result row packet: invalid header");
+            }
+            if let Err(error) = budget.row() {
+                return self.fail(error.to_string());
+            }
+            saw_binary_row = true;
+        }
+        if saw_binary_row {
+            Err(DbError::new(
+                "UNSUPPORTED: MySQL binary protocol result decoding is not implemented",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn read_metadata(
+        &mut self,
+        count: usize,
+        what: &'static str,
+        budget: &mut Budget,
+        deadline: Instant,
+    ) -> Result<(), DbError> {
+        if count == 0 {
+            return Ok(());
+        }
+        for _ in 0..count {
+            let packet = self.read_packet(budget, deadline)?;
+            if is_err(&packet) {
+                return self.typed_error(&packet);
+            }
+            if is_eof(&packet) || is_deprecated_ok(&packet, self.deprecate_eof()) {
+                return self.fail(format!(
+                    "mysql {what} metadata ended before all definitions"
+                ));
+            }
+            if let Err(error) = parse_column_definition(&packet) {
+                return self.fail(error.to_string());
+            }
+        }
+        self.read_metadata_end(budget, deadline, what)
+    }
+
+    fn read_metadata_end(
+        &mut self,
+        budget: &mut Budget,
+        deadline: Instant,
+        what: &'static str,
+    ) -> Result<(), DbError> {
+        let packet = self.read_packet(budget, deadline)?;
+        if is_err(&packet) {
+            return self.typed_error(&packet);
+        }
+        if is_eof(&packet) {
+            if let Err(error) = parse_eof(&packet) {
+                return self.fail(error.to_string());
+            }
+            return Ok(());
+        }
+        if is_deprecated_ok(&packet, self.deprecate_eof()) {
+            if let Err(error) = parse_ok(&packet, self.deprecate_eof()) {
+                return self.fail(error.to_string());
+            }
+            return Ok(());
+        }
+        self.fail(format!("mysql {what} metadata did not end with EOF/OK"))
+    }
+
+    fn read_result_columns(
+        &mut self,
+        first: &[u8],
+        budget: &mut Budget,
+        deadline: Instant,
+    ) -> Result<Vec<Column>, DbError> {
+        let count = match parse_column_count(first) {
+            Ok(count) => count,
+            Err(error) => return self.fail(error.to_string()),
+        };
+        let mut columns = Vec::with_capacity(count);
+        for _ in 0..count {
+            let packet = self.read_packet(budget, deadline)?;
+            if is_err(&packet) {
+                return self.typed_error(&packet);
+            }
+            if is_eof(&packet) || is_deprecated_ok(&packet, self.deprecate_eof()) {
+                return self.fail("mysql result set ended before all column definitions");
+            }
+            let column = match parse_column_definition(&packet) {
+                Ok(column) => column,
+                Err(error) => return self.fail(error.to_string()),
+            };
+            columns.push(column);
+        }
+        self.read_metadata_end(budget, deadline, "result column")?;
+        Ok(columns)
     }
 
     fn run_query(&mut self, sql: &str) -> Result<Vec<Row>, DbError> {
@@ -669,9 +986,9 @@ fn parse_handshake(payload: &[u8]) -> Result<Handshake, DbError> {
     nonce[part1.len()..].copy_from_slice(&part2[..needed]);
     let plugin = cursor.cstring()?;
     cursor.done()?;
-    if plugin != NATIVE_PLUGIN {
+    if plugin != NATIVE_PLUGIN && plugin != CACHING_PLUGIN {
         return Err(DbError::new(format!(
-            "UNSUPPORTED: MySQL authentication plugin {plugin:?} is not implemented; only {NATIVE_PLUGIN} is supported"
+            "UNSUPPORTED: MySQL authentication plugin {plugin:?} is not implemented; only {NATIVE_PLUGIN} and {CACHING_PLUGIN} are supported"
         )));
     }
     Ok(Handshake {
@@ -710,7 +1027,7 @@ fn handshake_response(
             "mysql server lacks required capabilities 0x{missing:08x}"
         )));
     }
-    let scramble = native_password_scramble(password, &handshake.nonce);
+    let scramble = auth_response(&handshake.plugin, password, &handshake.nonce)?;
     let mut payload = Vec::new();
     payload.extend_from_slice(&capabilities.to_le_bytes());
     payload.extend_from_slice(&(MAX_PACKET_LEN as u32).to_le_bytes());
@@ -722,10 +1039,24 @@ fn handshake_response(
     payload.extend_from_slice(&scramble);
     payload.extend_from_slice(database.as_bytes());
     payload.push(0);
-    payload.extend_from_slice(NATIVE_PLUGIN.as_bytes());
+    payload.extend_from_slice(handshake.plugin.as_bytes());
     payload.push(0);
-    // shortcut: no TLS negotiation; CLIENT_SSL is never set, add TLS in R9+.
+    // shortcut: no TLS negotiation; CLIENT_SSL is never set, add TLS in R11+.
     Ok((capabilities, payload))
+}
+
+fn auth_response(
+    plugin: &str,
+    password: &str,
+    nonce: &[u8; SCRAMBLE_LEN],
+) -> Result<Vec<u8>, DbError> {
+    match plugin {
+        NATIVE_PLUGIN => Ok(native_password_scramble(password, nonce)),
+        CACHING_PLUGIN => Ok(caching_sha2_scramble(password, nonce)),
+        other => Err(DbError::new(format!(
+            "UNSUPPORTED: MySQL authentication plugin {other:?} is not implemented"
+        ))),
+    }
 }
 
 fn native_password_scramble(password: &str, nonce: &[u8; SCRAMBLE_LEN]) -> Vec<u8> {
@@ -745,71 +1076,196 @@ fn native_password_scramble(password: &str, nonce: &[u8; SCRAMBLE_LEN]) -> Vec<u
         .collect()
 }
 
-fn sha1(data: &[u8]) -> [u8; SCRAMBLE_LEN] {
-    let mut state = [
-        0x6745_2301u32,
-        0xefcd_ab89,
-        0x98ba_dcfe,
-        0x1032_5476,
-        0xc3d2_e1f0,
-    ];
-    let bit_len = (data.len() as u64) * 8;
-    let mut padded = Vec::with_capacity(((data.len() + 9 + 63) / 64) * 64);
-    padded.extend_from_slice(data);
-    padded.push(0x80);
-    while padded.len() % 64 != 56 {
-        padded.push(0);
+/// MySQL 8.0 fast auth: `XOR(SHA256(p), SHA256(SHA256(SHA256(p)) || nonce))`.
+fn caching_sha2_scramble(password: &str, nonce: &[u8; SCRAMBLE_LEN]) -> Vec<u8> {
+    if password.is_empty() {
+        return Vec::new();
     }
-    padded.extend_from_slice(&bit_len.to_be_bytes());
-    for block in padded.chunks_exact(64) {
-        let mut words = [0u32; 80];
-        for (index, word) in words.iter_mut().enumerate().take(16) {
-            let offset = index * 4;
-            *word = u32::from_be_bytes([
-                block[offset],
-                block[offset + 1],
-                block[offset + 2],
-                block[offset + 3],
-            ]);
-        }
-        for index in 16..80 {
-            words[index] =
-                (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16])
-                    .rotate_left(1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e) =
-            (state[0], state[1], state[2], state[3], state[4]);
-        for (index, word) in words.iter().enumerate() {
-            let (function, constant) = match index {
-                0..=19 => ((b & c) | (!b & d), 0x5a82_7999),
-                20..=39 => (b ^ c ^ d, 0x6ed9_eba1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
-                _ => (b ^ c ^ d, 0xca62_c1d6),
-            };
-            let temp = a
-                .rotate_left(5)
-                .wrapping_add(function)
-                .wrapping_add(e)
-                .wrapping_add(constant)
-                .wrapping_add(*word);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temp;
-        }
-        state[0] = state[0].wrapping_add(a);
-        state[1] = state[1].wrapping_add(b);
-        state[2] = state[2].wrapping_add(c);
-        state[3] = state[3].wrapping_add(d);
-        state[4] = state[4].wrapping_add(e);
+    let stage1 = sha256(password.as_bytes());
+    let stage2 = sha256(&stage1);
+    let stage3 = sha256(&stage2);
+    let mut combined = Vec::with_capacity(stage3.len() + nonce.len());
+    combined.extend_from_slice(&stage3);
+    combined.extend_from_slice(nonce);
+    let response = sha256(&combined);
+    stage1
+        .iter()
+        .zip(response.iter())
+        .map(|(left, right)| left ^ right)
+        .collect()
+}
+
+/// Full auth encrypts a NUL-terminated password whose bytes are XORed with the nonce.
+fn full_auth_message(password: &str, nonce: &[u8; SCRAMBLE_LEN]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(password.len() + 1);
+    for (index, byte) in password.as_bytes().iter().enumerate() {
+        message.push(*byte ^ nonce[index % SCRAMBLE_LEN]);
     }
-    let mut digest = [0u8; SCRAMBLE_LEN];
-    for (index, word) in state.iter().enumerate() {
-        let offset = index * 4;
-        digest[offset..offset + 4].copy_from_slice(&(*word).to_be_bytes());
+    message.push(0);
+    message
+}
+
+fn rsa_error(error: String) -> String {
+    if error.starts_with("UNSUPPORTED:") {
+        error
+    } else {
+        format!("mysql RSA full authentication failed: {error}")
     }
-    digest
+}
+
+fn auth_more_status(payload: &[u8]) -> Option<u8> {
+    (payload.len() == 2 && payload[0] == AUTH_MORE_DATA).then_some(payload[1])
+}
+
+struct AuthSwitch {
+    plugin: String,
+    nonce: [u8; SCRAMBLE_LEN],
+}
+
+fn parse_auth_switch(payload: &[u8]) -> Result<Option<AuthSwitch>, DbError> {
+    if payload.first() != Some(&0xfe) || payload.len() < DEPRECATED_OK_LIMIT {
+        return Ok(None);
+    }
+    let mut cursor = Cursor::new(payload, "AuthSwitchRequest");
+    let _status = cursor.u8()?;
+    let plugin = cursor.cstring()?;
+    let rest = cursor.rest()?;
+    let nonce_bytes = if rest.last() == Some(&0) {
+        &rest[..rest.len() - 1]
+    } else {
+        rest
+    };
+    if nonce_bytes.len() != SCRAMBLE_LEN {
+        return Err(malformed(
+            "AuthSwitchRequest",
+            "auth data is not a 20-byte nonce",
+        ));
+    }
+    let mut nonce = [0u8; SCRAMBLE_LEN];
+    nonce.copy_from_slice(nonce_bytes);
+    Ok(Some(AuthSwitch { plugin, nonce }))
+}
+
+fn parse_prepare_ok(payload: &[u8]) -> Result<MySqlStatement, DbError> {
+    let mut cursor = Cursor::new(payload, "prepare OK");
+    if cursor.u8()? != 0x00 {
+        return Err(malformed("prepare OK", "invalid header"));
+    }
+    let id = cursor.u32_le()?;
+    let column_count = cursor.u16_le()?;
+    let param_count = cursor.u16_le()?;
+    if cursor.u8()? != 0 {
+        return Err(malformed("prepare OK", "nonzero filler"));
+    }
+    let warning_count = cursor.u16_le()?;
+    cursor.done()?;
+    if usize::from(column_count) > MAX_COLUMNS {
+        return Err(malformed(
+            "prepare OK",
+            &format!("column count exceeds {MAX_COLUMNS}"),
+        ));
+    }
+    if usize::from(param_count) > MAX_STMT_PARAMS {
+        return Err(malformed(
+            "prepare OK",
+            &format!("parameter count exceeds {MAX_STMT_PARAMS}"),
+        ));
+    }
+    Ok(MySqlStatement {
+        id,
+        column_count,
+        param_count,
+        warning_count,
+    })
+}
+
+fn build_stmt_execute(statement: MySqlStatement, params: &[Value]) -> Result<Vec<u8>, DbError> {
+    let count = usize::from(statement.param_count);
+    if count != params.len() {
+        return Err(DbError::new(format!(
+            "mysql statement expects {} parameters but received {}",
+            count,
+            params.len()
+        )));
+    }
+    if count > MAX_STMT_PARAMS {
+        return Err(DbError::new(format!(
+            "mysql statement parameter count exceeds {MAX_STMT_PARAMS}"
+        )));
+    }
+    let mut encoded = Vec::with_capacity(count);
+    for param in params {
+        let item = match param {
+            Value::Int(number) => (MYSQL_TYPE_LONGLONG, 0u8, number.to_le_bytes().to_vec()),
+            Value::Bool(flag) => (MYSQL_TYPE_TINY, 0u8, vec![u8::from(*flag)]),
+            Value::Text(text) => {
+                let bytes = text.as_bytes();
+                if bytes.len() > MAX_STMT_VALUE_BYTES {
+                    return Err(DbError::new(format!(
+                        "mysql statement value exceeds {MAX_STMT_VALUE_BYTES} bytes"
+                    )));
+                }
+                let mut value = Vec::with_capacity(bytes.len() + 3);
+                push_lenenc_int(&mut value, bytes.len())?;
+                value.extend_from_slice(bytes);
+                (MYSQL_TYPE_STRING, 0u8, value)
+            }
+        };
+        encoded.push(item);
+    }
+    let null_bitmap_len = count.saturating_add(7) / 8;
+    let mut total = 1usize + 4 + 1 + 4;
+    if count > 0 {
+        total = total
+            .checked_add(null_bitmap_len)
+            .and_then(|total| total.checked_add(1))
+            .and_then(|total| total.checked_add(count.saturating_mul(2)))
+            .ok_or_else(|| DbError::new("mysql statement execute length overflow"))?;
+        for (_, _, value) in &encoded {
+            total = total
+                .checked_add(value.len())
+                .ok_or_else(|| DbError::new("mysql statement execute length overflow"))?;
+        }
+    }
+    if total > MAX_PACKET_LEN {
+        return Err(DbError::new(format!(
+            "mysql command packet exceeds {MAX_PACKET_LEN}-byte limit"
+        )));
+    }
+    let mut payload = Vec::with_capacity(total);
+    payload.push(COM_STMT_EXECUTE);
+    payload.extend_from_slice(&statement.id.to_le_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    if count > 0 {
+        payload.extend(std::iter::repeat_n(0u8, null_bitmap_len));
+        payload.push(1);
+        for (type_code, flags, _) in &encoded {
+            payload.push(*type_code);
+            payload.push(*flags);
+        }
+        for (_, _, value) in &encoded {
+            payload.extend_from_slice(value);
+        }
+    }
+    Ok(payload)
+}
+
+fn push_lenenc_int(output: &mut Vec<u8>, value: usize) -> Result<(), DbError> {
+    if value < 0xfb {
+        output.push(value as u8);
+    } else if value <= 0xffff {
+        output.push(0xfc);
+        output.extend_from_slice(&(value as u16).to_le_bytes());
+    } else if value <= 0xff_ffff {
+        output.push(0xfd);
+        output.extend_from_slice(&(value as u32).to_le_bytes()[..3]);
+    } else {
+        return Err(DbError::new(
+            "mysql statement value length exceeds the length-encoded integer bound",
+        ));
+    }
+    Ok(())
 }
 
 fn is_err(payload: &[u8]) -> bool {
@@ -982,9 +1438,26 @@ fn text_value(column: &Column, text: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mysql_crypto::{
+        decrypt_oaep_sha1, encrypt_oaep_sha1_with_seed, TEST_MODULUS_HEX, TEST_OAEP_CIPHERTEXT_HEX,
+        TEST_OAEP_SEED, TEST_PRIVATE_EXPONENT_HEX, TEST_PUBLIC_KEY_PEM,
+    };
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn hex_bytes(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn nonce() -> [u8; SCRAMBLE_LEN] {
+        [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+        ]
     }
 
     #[test]
@@ -1043,5 +1516,98 @@ mod tests {
         );
         assert_eq!(MySqlErrorKind::from_code(9999), MySqlErrorKind::Other);
         assert_eq!(MySqlErrorKind::Syntax.label(), "syntax error");
+    }
+
+    #[test]
+    fn caching_sha2_sha256_known_answer_vectors() {
+        assert_eq!(
+            hex(&sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(&sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex(&sha256(b"The quick brown fox jumps over the lazy dog")),
+            "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"
+        );
+        assert_eq!(
+            hex(&sha256(&vec![b'a'; 64])),
+            "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"
+        );
+        assert_eq!(
+            hex(&sha256(&vec![b'a'; 1_000_000])),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn caching_sha2_fast_scramble_known_answer_vectors() {
+        assert_eq!(
+            hex(&caching_sha2_scramble("secret", &nonce())),
+            "33f3676ed12f11181e3898714922b5fc3aea77f11729a61eaf781b56a306b82b"
+        );
+        assert!(caching_sha2_scramble("", &nonce()).is_empty());
+    }
+
+    #[test]
+    fn caching_sha2_oaep_sha1_known_answer_vector() {
+        let key = parse_spki_pem(TEST_PUBLIC_KEY_PEM.as_bytes())
+            .expect("test SPKI RSA public key must parse");
+        let message = full_auth_message("secret", &nonce());
+        assert_eq!(hex(&message), "72676076607200");
+        let ciphertext = encrypt_oaep_sha1_with_seed(&key, &message, &TEST_OAEP_SEED)
+            .expect("fixed-seed RSA-OAEP encryption must succeed");
+        assert_eq!(hex(&ciphertext), TEST_OAEP_CIPHERTEXT_HEX);
+        let decrypted = decrypt_oaep_sha1(
+            &ciphertext,
+            &hex_bytes(TEST_MODULUS_HEX),
+            &hex_bytes(TEST_PRIVATE_EXPONENT_HEX),
+        )
+        .expect("RSA-OAEP private-key decryption must succeed");
+        assert_eq!(decrypted, message);
+    }
+
+    #[test]
+    fn stmt_prepare_execute_framing_is_bounded() {
+        let statement = MySqlStatement {
+            id: 7,
+            column_count: 0,
+            param_count: 2,
+            warning_count: 0,
+        };
+        let payload = build_stmt_execute(statement, &[Value::Int(7), Value::Text("x".to_string())])
+            .expect("bounded statement execute frame must build");
+        let mut expected = vec![COM_STMT_EXECUTE];
+        expected.extend_from_slice(&7u32.to_le_bytes());
+        expected.push(0);
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        expected.extend_from_slice(&[0, 1, MYSQL_TYPE_LONGLONG, 0, MYSQL_TYPE_STRING, 0]);
+        expected.extend_from_slice(&7i64.to_le_bytes());
+        expected.extend_from_slice(&[1, b'x']);
+        assert_eq!(payload, expected);
+
+        let mismatch = build_stmt_execute(statement, &[Value::Int(7)]).unwrap_err();
+        assert!(
+            mismatch.to_string().contains("expects 2 parameters"),
+            "{mismatch}"
+        );
+        let oversized = build_stmt_execute(
+            statement,
+            &[
+                Value::Int(7),
+                Value::Text("x".repeat(MAX_STMT_VALUE_BYTES + 1)),
+            ],
+        )
+        .unwrap_err();
+        assert!(oversized.to_string().contains("exceeds"), "{oversized}");
+        let too_many = MySqlStatement {
+            param_count: (MAX_STMT_PARAMS + 1) as u16,
+            ..statement
+        };
+        let params = vec![Value::Int(1); MAX_STMT_PARAMS + 1];
+        let count_error = build_stmt_execute(too_many, &params).unwrap_err();
+        assert!(count_error.to_string().contains("exceeds"), "{count_error}");
     }
 }
