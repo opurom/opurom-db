@@ -72,7 +72,8 @@ let model = Model::from_ir(&ir_value)?;        // one model entry
 create_table(&mut db, &model)?;                // CREATE TABLE IF NOT EXISTS
 let row = create(&mut db, &model, &[("title", Value::Text("x".into()))])?;
 let rows = list(&mut db, &model)?;
-let one = get(&mut db, &model, 1)?;           // Result<Option<Row>, DbError>
+let page = list_paged(&mut db, &model, 10, 0)?;   // limit, offset
+let one = get(&mut db, &model, 1)?;               // Result<Option<Row>, DbError>
 let ok = update(&mut db, &model, 1, &[("done", Value::Bool(true))])?;
 let ok = delete(&mut db, &model, 1)?;         // bool: a row existed
 ```
@@ -81,6 +82,12 @@ let ok = delete(&mut db, &model, 1)?;         // bool: a row existed
 type zero value (`0` / `""` / `false`). An omitted `int` primary key is
 auto-assigned as `max(id) + 1`. Supplied column names are validated against
 the model and the identifier rule `[A-Za-z_][A-Za-z0-9_]*`.
+
+`list_paged` pages rows deterministically: ascending by primary key on every
+driver, so pages never depend on insertion timing or driver row order. `limit`
+must be a positive integer up to `MAX_PAGE_LIMIT` (`1000`) and `offset` must be
+non-negative — out-of-range values return a readable `DbError`. Like `get` /
+`update` / `delete`, it requires a model with a primary field.
 
 ## Pooled SQLite handle
 
@@ -351,8 +358,9 @@ cargo fmt --all
 cargo test
 ```
 
-Fourteen integration tests cover the core: SQLite CRUD round-trip against a
-temp file, native parameter binding with quotes, KV persistence across two
+Fifteen integration tests cover the core: SQLite CRUD round-trip against a
+temp file, deterministic pagination across repeated runs and insertion orders,
+native parameter binding with quotes, KV persistence across two
 opens, KV and Memory CRUD, migration SQL content and idempotency, malformed
 IR rejection, SQL injection on identifiers, empty-model migrations, the
 `opurom-migrate` binary, the `Row` / `Value` helpers, and eight threads

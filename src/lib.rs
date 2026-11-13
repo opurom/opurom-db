@@ -28,7 +28,7 @@ mod sqlite;
 #[path = "sqlite_stub.rs"]
 mod sqlite;
 
-pub use crud::{create, create_table, delete, get, list, update};
+pub use crud::{create, create_table, delete, get, list, list_paged, update, MAX_PAGE_LIMIT};
 pub use kv::Kv;
 pub use memory::Memory;
 pub use model::{
