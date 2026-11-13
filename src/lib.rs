@@ -266,6 +266,38 @@ impl fmt::Display for DbError {
 
 impl std::error::Error for DbError {}
 
+/// The result of `PRAGMA integrity_check`: one line per problem SQLite found
+/// in the database file. An empty list means the file passed the check.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IntegrityReport {
+    problems: Vec<String>,
+}
+
+impl IntegrityReport {
+    /// True when the check found no problem.
+    pub fn is_ok(&self) -> bool {
+        self.problems.is_empty()
+    }
+
+    /// One entry per problem, in the order SQLite reported them.
+    pub fn problems(&self) -> &[String] {
+        &self.problems
+    }
+}
+
+/// One child row `PRAGMA foreign_key_check` found without a matching parent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignKeyViolation {
+    /// The child table that holds the unmatched row.
+    pub table: String,
+    /// The `rowid` of that row, when the child table has one.
+    pub rowid: Option<i64>,
+    /// The parent table the foreign key points at.
+    pub parent: String,
+    /// The index of the foreign key constraint inside the child table.
+    pub foreign_key: i64,
+}
+
 /// The unified data abstraction. All drivers accept plain SQL text.
 pub trait Database {
     fn exec(&mut self, sql: &str) -> Result<(), DbError>;
@@ -284,6 +316,40 @@ pub trait Database {
         self.query(&sql)
     }
 
+    /// Run SQLite's `PRAGMA integrity_check` and report what it found.
+    ///
+    /// The default executes the pragma through [`Database::query`], so every
+    /// driver answers with its own semantics: SQLite returns the typed report
+    /// and a driver without SQLite pragmas returns its readable SQL error.
+    fn integrity_check(&mut self) -> Result<IntegrityReport, DbError> {
+        let rows = self.query("PRAGMA integrity_check")?;
+        let mut problems = Vec::new();
+        for row in &rows {
+            // SQLite answers one row per problem, or the single row "ok".
+            if let Some(Value::Text(text)) = row.columns().next().map(|(_, value)| value) {
+                if text != "ok" {
+                    problems.push(text.clone());
+                }
+            }
+        }
+        Ok(IntegrityReport { problems })
+    }
+
+    /// Run SQLite's `PRAGMA foreign_key_check`: one typed violation per child
+    /// row that has no matching parent, and an empty list when none exist.
+    fn foreign_key_check(&mut self) -> Result<Vec<ForeignKeyViolation>, DbError> {
+        let rows = self.query("PRAGMA foreign_key_check")?;
+        Ok(rows
+            .iter()
+            .map(|row| ForeignKeyViolation {
+                table: text_cell(row, "table"),
+                rowid: row.get("rowid").and_then(Value::as_i64),
+                parent: text_cell(row, "parent"),
+                foreign_key: row.get("fkid").and_then(Value::as_i64).unwrap_or_default(),
+            })
+            .collect())
+    }
+
     /// Begin an explicit transaction: `BEGIN` is sent now, `COMMIT` /
     /// `ROLLBACK` run on the returned [`Transaction`] guard, and a guard
     /// dropped while still open sends `ROLLBACK`. The default works for any
@@ -294,6 +360,15 @@ pub trait Database {
         Self: Sized,
     {
         Transaction::begin(self)
+    }
+}
+
+/// The text cell `name` of `row`, or an empty string when the driver reports
+/// no such column.
+fn text_cell(row: &Row, name: &str) -> String {
+    match row.get(name) {
+        Some(Value::Text(text)) => text.clone(),
+        _ => String::new(),
     }
 }
 

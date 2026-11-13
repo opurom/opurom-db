@@ -25,6 +25,10 @@ pub trait Database {
     fn exec_params(&mut self, sql: &str, params: &[Value]) -> Result<(), DbError>;
     fn query_params(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError>;
 
+    // Default methods running SQLite's integrity pragmas through `query`.
+    fn integrity_check(&mut self) -> Result<IntegrityReport, DbError>;
+    fn foreign_key_check(&mut self) -> Result<Vec<ForeignKeyViolation>, DbError>;
+
     fn transaction(&mut self) -> Result<Transaction<'_, Self>, DbError> where Self: Sized;
 }
 ```
@@ -59,6 +63,8 @@ pub trait Database {
 | `Row::get(&str) -> Option<&Value>` | plus `Row::new()`, `insert`, `set`, `columns`, `len`, `is_empty` |
 | `DbError` | `Display`, `Debug`, `std::error::Error`; driver message, optional `sqlstate()`, `mysql_code()` and `mysql_error_kind()` |
 | `Database::transaction()` | sends `BEGIN` and returns a guard; statements run through the guard, whose drop rolls back an open transaction |
+| `Database::integrity_check()` | default method running `PRAGMA integrity_check` through `query`; returns `IntegrityReport` with `is_ok()` and `problems()` |
+| `Database::foreign_key_check()` | default method running `PRAGMA foreign_key_check` through `query`; returns `Vec<ForeignKeyViolation>` with `table`, `rowid`, `parent` and `foreign_key`, empty when nothing is wrong |
 | `Transaction::commit()` / `rollback()` | explicit `COMMIT` / `ROLLBACK`; both release the driver borrow |
 
 `Row::insert(name, value)` works both in place (`let mut r = Row::new();
@@ -383,15 +389,18 @@ cargo fmt --all
 cargo test
 ```
 
-Twenty integration tests cover the core: SQLite CRUD round-trip against a
+Twenty-three integration tests cover the core: SQLite CRUD round-trip against a
 temp file, deterministic pagination across repeated runs and insertion orders,
 native parameter binding with quotes, KV persistence across two
 opens, KV and Memory CRUD, migration SQL content and idempotency, malformed
 IR rejection, SQL injection on identifiers, empty-model migrations, the
 `opurom-migrate` binary, the `Row` / `Value` helpers, eight threads
-sharing one `PooledDb` for insert/read/update/delete, and five SQLite
+sharing one `PooledDb` for insert/read/update/delete, five SQLite
 transaction cases (commit, explicit rollback, rollback on drop, a failed
-commit and nested `BEGIN` rejection).
+commit and nested `BEGIN` rejection), the `integrity_check` report for a clean
+file and the `foreign_key_check` violation typed down to its table, `rowid`,
+parent and constraint index through `&mut dyn Database`, and both pragmas
+refused readably by the `Memory` driver.
 
 Eight tests in `tests/pg_protocol.rs` cover a loopback mock server: startup
 and `Query` framing, `ParameterStatus` / `BackendKeyData` parsing, a two-row
@@ -430,8 +439,8 @@ SHA-256 known-answer vectors, the native-password scramble, the real MySQL 8.0
 fast-auth scramble, a deterministic RSA-OAEP ciphertext, and bounded statement
 framing.
 
-`cargo test --offline` runs 54 integration tests, 8 unit tests and 0 doc
-tests (62 total). `cargo fmt --all` and
+`cargo test --offline` runs 57 integration tests, 8 unit tests and 0 doc
+tests (65 total). `cargo fmt --all` and
 `RUSTFLAGS="-D warnings" cargo test --offline` pass with zero warnings. Sockets
 bind to `127.0.0.1` on ephemeral ports and every server runs on background
 threads of the test process, so no external PostgreSQL or MySQL server is
@@ -441,9 +450,10 @@ contacted and no server process is left running.
 
 Verified: SQLite via FFI on macOS/Linux, embedded file-backed KV, in-memory
 store, typed CRUD helpers, deterministic/idempotent migration SQL, identifier
-validation, parameter binding, explicit transactions with a guard that rolls
-back on drop, a Mutex-serialized shared SQLite handle with a
-threaded CRUD test, `opurom-db` library and `opurom-migrate` binary. Also
+validation, parameter binding, `PRAGMA integrity_check` / `PRAGMA
+foreign_key_check` through the trait with typed reports, explicit transactions
+with a guard that rolls back on drop, a Mutex-serialized shared SQLite handle
+with a threaded CRUD test, `opurom-db` library and `opurom-migrate` binary. Also
 verified against a local TCP mock: PostgreSQL v3 startup and simple-query
 framing, typed text rows, readable errors, unsupported-auth rejection,
 size/time bounds, and `Database` trait routing. The bundled

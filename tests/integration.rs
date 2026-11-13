@@ -946,3 +946,73 @@ fn sqlite_nested_transaction_begin_is_a_readable_error() {
     tx.rollback().unwrap();
     db.transaction().unwrap().commit().unwrap();
 }
+
+#[test]
+fn integrity_check_reports_a_clean_database_through_the_trait() {
+    let dir = TempDir::new("integrity");
+    let path = dir
+        .path()
+        .join("check.sqlite")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let mut db = Sqlite::open(&path).unwrap();
+    db.exec("CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT);")
+        .unwrap();
+    db.exec("INSERT INTO item VALUES (1, 'first');").unwrap();
+
+    let db: &mut dyn Database = &mut db;
+    let report = db.integrity_check().expect("the pragma runs");
+    assert!(
+        report.is_ok(),
+        "a freshly written database passes: {:?}",
+        report.problems()
+    );
+    assert!(report.problems().is_empty());
+    assert!(db.foreign_key_check().expect("the pragma runs").is_empty());
+}
+
+#[test]
+fn foreign_key_check_reports_a_typed_violation() {
+    let dir = TempDir::new("foreign-key");
+    let path = dir.path().join("fk.sqlite").to_str().unwrap().to_string();
+    let mut db = Sqlite::open(&path).unwrap();
+    db.exec("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+        .unwrap();
+    db.exec(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));",
+    )
+    .unwrap();
+    db.exec("INSERT INTO parent VALUES (1);").unwrap();
+    db.exec("INSERT INTO child VALUES (1, 1);").unwrap();
+    // Foreign key enforcement is off by default, so the orphan is stored and
+    // only the check reports it.
+    db.exec("INSERT INTO child VALUES (2, 99);").unwrap();
+
+    let violations = db.foreign_key_check().expect("the pragma runs");
+    assert_eq!(
+        violations.len(),
+        1,
+        "only the orphan is reported: {violations:?}"
+    );
+    assert_eq!(violations[0].table, "child");
+    assert_eq!(violations[0].rowid, Some(2));
+    assert_eq!(violations[0].parent, "parent");
+    assert_eq!(violations[0].foreign_key, 0);
+
+    db.exec("DELETE FROM child WHERE id = 2;").unwrap();
+    assert!(db.foreign_key_check().expect("the pragma runs").is_empty());
+}
+
+#[test]
+fn pragma_checks_answer_readably_without_sqlite_semantics() {
+    let mut db = Memory::new();
+    let integrity = db
+        .integrity_check()
+        .expect_err("Memory has no SQLite pragmas");
+    assert!(!integrity.message().is_empty());
+    let foreign_keys = db
+        .foreign_key_check()
+        .expect_err("Memory has no SQLite pragmas");
+    assert!(!foreign_keys.message().is_empty());
+}
