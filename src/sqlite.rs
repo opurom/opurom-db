@@ -118,8 +118,9 @@ impl Drop for Stmt {
     }
 }
 
-/// Owned buffers for bound text; must outlive the prepared statement.
-type BoundText = Vec<Option<CString>>;
+/// Owned byte buffers for bound text; must outlive the prepared statement.
+/// CString rejects embedded NUL bytes, so bind raw UTF-8 bytes plus a terminator.
+type BoundText = Vec<Option<Vec<u8>>>;
 
 impl Conn {
     fn open(path: &str) -> Result<Conn, DbError> {
@@ -198,7 +199,11 @@ impl Conn {
         let mut owned: BoundText = Vec::with_capacity(params.len());
         for p in params {
             match p {
-                Value::Text(s) => owned.push(Some(cstring(s, "bound text")?)),
+                Value::Text(s) => {
+                    let mut buf = s.as_bytes().to_vec();
+                    buf.push(0);
+                    owned.push(Some(buf));
+                }
                 _ => owned.push(None),
             }
         }
@@ -209,9 +214,11 @@ impl Conn {
                 Value::Bool(b) => unsafe { sqlite3_bind_int64(stmt.0, index, i64::from(*b)) },
                 Value::Text(_) => {
                     let buf = owned[i].as_ref().expect("text buffer was prepared");
-                    let len = buf.as_bytes().len() as c_int;
+                    let len = (buf.len() - 1) as c_int;
                     // SQLITE_STATIC (null destructor): buf outlives stmt.
-                    unsafe { sqlite3_bind_text(stmt.0, index, buf.as_ptr(), len, None) }
+                    unsafe {
+                        sqlite3_bind_text(stmt.0, index, buf.as_ptr() as *const c_char, len, None)
+                    }
                 }
             };
             if rc != SQLITE_OK {
@@ -302,8 +309,11 @@ impl Sqlite {
 
     /// Execute `sql` with real `sqlite3_bind_*` parameter binding.
     pub fn exec_params(&mut self, sql: &str, params: &[Value]) -> Result<(), DbError> {
-        let (stmt, _owned) = self.conn.prepare(sql, params)?;
-        self.conn.run(&stmt)
+        let (stmt, owned) = self.conn.prepare(sql, params)?;
+        let result = self.conn.run(&stmt);
+        drop(stmt);
+        drop(owned);
+        result
     }
 
     /// Query with real `sqlite3_bind_*` parameter binding.

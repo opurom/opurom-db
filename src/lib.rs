@@ -1,4 +1,4 @@
-//! Opurom capability/capability/capability data layer.
+//! Opurom data layer.
 //!
 //! Five interchangeable [`Database`] drivers: [`Sqlite`] (direct FFI to the
 //! macOS/Linux system libsqlite3), [`PgConnection`] (pure-std PostgreSQL v3
