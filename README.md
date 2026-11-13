@@ -1,13 +1,13 @@
 # opurom-db
 
-R2/R4/R5/R7/R8/R10 data layer for OPUROM: one `Database` trait over five drivers,
-typed IR-driven CRUD helpers, deterministic SQL migrations, an R4 shared SQLite
-handle, an R5 pure-std PostgreSQL v3 frontend, an R7 TLS client plus a
-bundled PostgreSQL-protocol conformance server, and an R10 pure-std MySQL
+Data layer for OPUROM: one `Database` trait over five drivers,
+typed IR-driven CRUD helpers, deterministic SQL migrations, a shared SQLite
+handle, a pure-std PostgreSQL v3 frontend, a TLS client plus a
+bundled PostgreSQL-protocol conformance server, and a pure-std MySQL
 protocol v10 frontend with `mysql_native_password`, MySQL 8.0
 `caching_sha2_password`, bounded prepared statements and a pure-Rust
 SHA-1/SHA-256/RSA-OAEP crypto helper.
-Rust 1.99.1; PostgreSQL uses `std::net::TcpStream` and, since R7, the pinned
+Rust 1.99.1; PostgreSQL uses `std::net::TcpStream` and the pinned
 pure-Rust `rustls` 0.23.46 (no OpenSSL, no C toolchain: the `ring` provider is
 selected explicitly). SQLite is reached through direct FFI to the system
 `libsqlite3` (`#[link(name = "sqlite3")]`), with no SQLite crate. The MySQL
@@ -81,7 +81,7 @@ type zero value (`0` / `""` / `false`). An omitted `int` primary key is
 auto-assigned as `max(id) + 1`. Supplied column names are validated against
 the model and the identifier rule `[A-Za-z_][A-Za-z0-9_]*`.
 
-## R4 pooled SQLite handle
+## Pooled SQLite handle
 
 ```rust
 let pool = PooledDb::open("./opurom.db")?;
@@ -101,7 +101,7 @@ usable and later calls still hold the same guard.
 
 This is one shared connection, not a sized pool of independent connections. It
 does not add transactions, authentication, TLS, connection pool sizing, or
-distributed coordination. The R4 server-side rate limit and structured request
+distributed coordination. The server-side rate limit and structured request
 log live in `opurom-server` (`OPR_RATE_LIMIT` and `OPR_LOG_JSON`); this crate
 only supplies the shared handle.
 
@@ -189,7 +189,7 @@ For full auth it sends the `0x02` public-key request, reads the SPKI RSA PEM in
 an `AuthMoreData` packet, encrypts the NUL-terminated password (password bytes
 XORed with the 20-byte nonce) with RSA-OAEP using SHA-1/MGF1 and a pure-std
 big-integer modular exponentiation, then sends the ciphertext. The path follows
-MySQL 8.0 semantics; it does not use the simplified R10 prompt formula or
+MySQL 8.0 semantics; it does not use the simplified prompt formula or
 PKCS#1 v1.5. Auth switches between the two supported plugins are handled;
 unknown plugins and full auth with an empty password return typed
 `UNSUPPORTED` errors. `query(sql)` sends `COM_QUERY` and parses OK (0x00 or
@@ -227,10 +227,10 @@ odd exponents and uses `/dev/urandom` on Unix; its textbook modular
 exponentiation is neither constant-time nor blinded and is not a general
 crypto library.
 
-Honest scope: no real MySQL server tested, no TLS negotiation or TLS-wrapped
-full-auth key exchange over a real socket, no binary protocol result decoding,
-no connection pooling, no LOCAL INFILE, and no multi-result sets. Those remain
-R11+.
+The conformance harness talks to mock servers, not to a real MySQL server.
+There is no TLS negotiation or TLS-wrapped full-auth key exchange over a real
+socket, no binary protocol result decoding, no connection pooling, no LOCAL
+INFILE and no multi-result sets.
 
 ### TLS client (`PgConnection::connect_tls`)
 
@@ -257,8 +257,8 @@ with a certificate error; with one, only certificates chaining to that anchor
 are accepted. There is no "trust everything" mode and no way to skip
 verification.
 
-Honest scope: no client-certificate mTLS, no OCSP or CRL, no revocation
-checking, no HSM, and no cipher-suite tuning beyond the library defaults.
+There is no client-certificate mTLS, no OCSP or CRL, no revocation checking,
+no HSM, and no cipher-suite tuning beyond the library defaults.
 
 ### Bundled conformance server (`PgServer`)
 
@@ -333,7 +333,7 @@ empty `models` array produces no numbered migration files (only an empty
 
 The generated server needs no env var and no startup step from this crate.
 It can apply migrations with `db.exec(&schema_sql)` or call
-`create_table(&mut db, &model)` per model at startup. In R4 the generated
+`create_table(&mut db, &model)` per model at startup. The generated
 service opens one `PooledDb` at startup and runs migrations through `with`.
 
 ## Build and tests
@@ -343,21 +343,21 @@ cargo fmt --all
 cargo test
 ```
 
-All 12 R4 integration tests remain green: SQLite CRUD round-trip against a
+Twelve integration tests cover the core: SQLite CRUD round-trip against a
 temp file, native parameter binding with quotes, KV persistence across two
 opens, KV and Memory CRUD, migration SQL content and idempotency, malformed
 IR rejection, SQL injection on identifiers, empty-model migrations, the
 `opurom-migrate` binary, the `Row` / `Value` helpers, and eight threads
 sharing one `PooledDb` for insert/read/update/delete.
 
-Six R5 tests in `tests/pg_protocol.rs` cover a loopback mock server: startup
+Six tests in `tests/pg_protocol.rs` cover a loopback mock server: startup
 and `Query` framing, `ParameterStatus` / `BackendKeyData` parsing, a two-row
 result with typed values and SQL NULL omission, CRUD routing through the
 `Database` trait, query/startup `ErrorResponse` rejection, startup/query
 truncation, invalid and oversized frame lengths, read timeout, and
 unsupported cleartext/MD5/SASL authentication.
 
-Eleven R7 tests in `tests/pgserver.rs` run the client against the bundled
+Eleven tests in `tests/pgserver.rs` run the client against the bundled
 server over real sockets: a multi-statement `BEGIN` / `INSERT` / `SELECT` /
 `COMMIT` transaction whose committed row survives (both as separate round
 trips and as one Query message), a `ROLLBACK` transaction whose row does not,
@@ -370,8 +370,8 @@ rejection of an untrusted self-signed certificate, the rejection of a
 certificate that does not chain to the supplied anchor, a plaintext server
 that refuses TLS, and a session that stays usable after a failed statement.
 
-Fourteen R10 integration tests in `tests/mysql_protocol.rs` speak real MySQL
-v10 bytes against loopback mock servers: the eight R8 cases (handshake with the
+Fourteen integration tests in `tests/mysql_protocol.rs` speak real MySQL
+v10 bytes against loopback mock servers: the eight core cases (handshake with the
 native-password scramble, a two-row `COM_QUERY` result, typed ERR/SQLSTATE
 mapping (1064, 1146, 1062 and 1045), truncated/malformed packets, packet-size
 and column-count bounds, sequence-id mismatches, auth failure and
@@ -383,15 +383,14 @@ SHA-256 known-answer vectors, the native-password scramble, the real MySQL 8.0
 fast-auth scramble, a deterministic RSA-OAEP ciphertext, and bounded statement
 framing.
 
-All 41 R9 tests remain green; R10 adds six integration tests and four unit
-tests (10 total). `cargo test --offline` therefore runs 43 integration tests,
-8 unit tests and 0 doc tests (51 total). `cargo fmt --all` and
+`cargo test --offline` runs 43 integration tests, 8 unit tests and 0 doc
+tests (51 total). `cargo fmt --all` and
 `RUSTFLAGS="-D warnings" cargo test --offline` pass with zero warnings. Sockets
 bind to `127.0.0.1` on ephemeral ports and every server runs on background
 threads of the test process, so no external PostgreSQL or MySQL server is
 contacted and no server process is left running.
 
-## Honest status (R10)
+## Status
 
 Verified: SQLite via FFI on macOS/Linux, embedded file-backed KV, in-memory
 store, typed CRUD helpers, deterministic/idempotent migration SQL, identifier
@@ -399,16 +398,16 @@ validation, parameter binding, a Mutex-serialized shared SQLite handle with a
 threaded CRUD test, `opurom-db` library and `opurom-migrate` binary. Also
 verified against a local TCP mock: PostgreSQL v3 startup and simple-query
 framing, typed text rows, readable errors, unsupported-auth rejection,
-size/time bounds, and `Database` trait routing. Since R7, additionally
-verified against the bundled PostgreSQL-protocol server over real sockets:
+size/time bounds, and `Database` trait routing. The bundled
+PostgreSQL-protocol server is additionally verified over real sockets:
 TLS 1.3 negotiation before the startup message with real certificate
 verification and rejection of an untrusted certificate, a real multi-statement
 transaction with commit and rollback, and SQLSTATE-to-`DbError` mapping.
-Since R8, a pure-std MySQL v10 frontend is verified against a local TCP mock:
+A pure-std MySQL v10 frontend is verified against a local TCP mock:
 protocol-10 handshake parsing, HandshakeResponse41 with the native-password
 SHA-1 scramble, OK/ERR/EOF/COM_QUERY result sets, typed MySQL error codes and
 SQLSTATEs, strict sequence ids, size bounds and deprecated-EOF OK packets.
-Since R10, the same mock verifies MySQL 8.0 `caching_sha2_password` semantics:
+The same mock verifies MySQL 8.0 `caching_sha2_password` semantics:
 SHA-256 known-answer vectors (`SHA256("abc")` is
 `ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad`), the
 real fast-auth scramble (for password `secret` and nonce `01..14` it is
@@ -419,20 +418,14 @@ decrypted by the test private key. Bounded `COM_STMT_PREPARE` /
 `UNSUPPORTED` path are verified too. No real MySQL server was tested.
 `cargo fmt --all` and `cargo test` pass with zero warnings.
 
-Still R11+: SCRAM/MD5/cleartext password authentication in the PostgreSQL
-client, TLS negotiation and a TLS-wrapped full-auth key exchange over a real
-socket for MySQL, binary result decoding, connection pooling, the full prepared
-statement lifecycle (`COM_STMT_CLOSE`, long data and cursors), migration
-rollback, ORM relations, real connection pool sizing, distributed rate limiting,
-and a distributed connection coordinator. The bundled PostgreSQL server is a
-conformance harness for a small SQL subset, not a PostgreSQL replacement; no
-third-party PostgreSQL server was tested. The TLS client has no mTLS, no
-OCSP/CRL and no revocation checking. `Kv` / `Memory` support only the small
-SQL subset listed above, not arbitrary SQL. `get` / `update` / `delete` require
-a declared primary field; models with zero primary fields are parsed but cannot
-be addressed by id yet. On targets other than macOS/Linux the SQLite driver is
-a documented unavailable stub. The MySQL driver has no TLS negotiation, no
-TLS-wrapped full-auth key exchange over a real socket, no binary result
-decoding, no pooling and no real MySQL server test; those remain R11+. The
-pure-std RSA helper is limited to 512..2048-bit SPKI keys, SHA-1/MGF1 OAEP,
-Unix `/dev/urandom`, and non-constant-time textbook modular exponentiation.
+The bundled PostgreSQL server is a conformance harness for a small SQL subset,
+not a PostgreSQL replacement; no third-party PostgreSQL server was tested. The
+TLS client has no mTLS, no OCSP/CRL and no revocation checking. `Kv` /
+`Memory` support only the small SQL subset listed above, not arbitrary SQL.
+`get` / `update` / `delete` require a declared primary field; models with zero
+primary fields are parsed but cannot be addressed by id yet. On targets other
+than macOS/Linux the SQLite driver is a documented unavailable stub. The MySQL
+driver has no TLS negotiation, no TLS-wrapped full-auth key exchange over a
+real socket, no binary result decoding and no pooling. The pure-std RSA helper
+is limited to 512..2048-bit SPKI keys, SHA-1/MGF1 OAEP, Unix `/dev/urandom`,
+and non-constant-time textbook modular exponentiation.

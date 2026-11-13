@@ -1041,7 +1041,7 @@ fn handshake_response(
     payload.push(0);
     payload.extend_from_slice(handshake.plugin.as_bytes());
     payload.push(0);
-    // shortcut: no TLS negotiation; CLIENT_SSL is never set, add TLS in R11+.
+    // shortcut: no TLS negotiation; CLIENT_SSL is never set.
     Ok((capabilities, payload))
 }
 
