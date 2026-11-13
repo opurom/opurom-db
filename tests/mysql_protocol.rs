@@ -1,3 +1,6 @@
+#[path = "../src/mysql_crypto.rs"]
+mod mysql_crypto;
+
 use opurom_db::{Database, MySqlConnection, MySqlErrorKind, Row, Value};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -10,7 +13,13 @@ const MAX_PACKET_LEN: usize = 1024 * 1024;
 const MAX_WIRE_PACKET: usize = 0xff_ffff;
 const MAX_TEST_FRAME: usize = 16 * 1024 * 1024;
 const NATIVE_PLUGIN: &str = "mysql_native_password";
+const CACHING_PLUGIN: &str = "caching_sha2_password";
+const UNSUPPORTED_PLUGIN: &str = "unknown_auth_plugin";
+const COM_STMT_PREPARE: u8 = 0x16;
+const COM_STMT_EXECUTE: u8 = 0x17;
 const EXPECTED_SCRAMBLE: &str = "b32bb3a583e1340c0a1108d58b1be49781ad8c2f";
+const EXPECTED_CACHING_SCRAMBLE: &str =
+    "33f3676ed12f11181e3898714922b5fc3aea77f11729a61eaf781b56a306b82b";
 const NONCE: [u8; 20] = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
 ];
@@ -35,7 +44,9 @@ const SERVER_CAPS_DEPRECATED: u32 = SERVER_CAPS | CLIENT_DEPRECATE_EOF;
 
 const TYPE_TINY: u8 = 1;
 const TYPE_LONG: u8 = 3;
+const TYPE_LONGLONG: u8 = 8;
 const TYPE_VARCHAR: u8 = 253;
+const TYPE_STRING: u8 = 0xfe;
 
 #[derive(Default)]
 struct Captured {
@@ -143,6 +154,94 @@ impl MockServer {
 }
 
 impl Drop for MockServer {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+enum Step {
+    Send(Vec<u8>),
+    Receive(Option<Vec<u8>>),
+}
+
+struct ScriptedServer {
+    address: SocketAddr,
+    handle: Option<JoinHandle<Vec<Vec<u8>>>>,
+}
+
+impl ScriptedServer {
+    fn spawn(steps: Vec<Step>) -> ScriptedServer {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let accept_deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        break stream;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= accept_deadline {
+                            return Vec::new();
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => return Vec::new(),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut frames = Vec::new();
+            for step in steps {
+                match step {
+                    Step::Send(bytes) => {
+                        if stream.write_all(&bytes).is_err() {
+                            break;
+                        }
+                    }
+                    Step::Receive(reply) => {
+                        match read_frame(&mut stream) {
+                            Ok(frame) => frames.push(frame),
+                            Err(_) => break,
+                        }
+                        if let Some(reply) = reply {
+                            if stream.write_all(&reply).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            frames
+        });
+        ScriptedServer {
+            address,
+            handle: Some(handle),
+        }
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    fn finish(mut self) -> Vec<Vec<u8>> {
+        let handle = self
+            .handle
+            .take()
+            .expect("scripted server handle is present");
+        handle.join().expect("scripted server thread panicked")
+    }
+}
+
+impl Drop for ScriptedServer {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -331,12 +430,41 @@ fn deprecated_result_set(
     bytes
 }
 
-fn auth_switch_packet(sequence: u8, plugin: &str) -> Vec<u8> {
+fn auth_switch_packet(sequence: u8, plugin: &str, nonce: &[u8; 20]) -> Vec<u8> {
     let mut body = vec![0xfe];
     body.extend_from_slice(&cstr(plugin));
-    body.extend_from_slice(&[0u8; 20]);
+    body.extend_from_slice(nonce);
     body.push(0);
     packet(sequence, &body)
+}
+
+fn auth_more_data(sequence: u8, data: &[u8]) -> Vec<u8> {
+    let mut body = vec![0x01];
+    body.extend_from_slice(data);
+    packet(sequence, &body)
+}
+
+fn prepare_ok_packet(sequence: u8, id: u32, columns: u16, params: u16, warnings: u16) -> Vec<u8> {
+    let mut body = vec![0x00];
+    body.extend_from_slice(&id.to_le_bytes());
+    body.extend_from_slice(&columns.to_le_bytes());
+    body.extend_from_slice(&params.to_le_bytes());
+    body.push(0);
+    body.extend_from_slice(&warnings.to_le_bytes());
+    packet(sequence, &body)
+}
+
+fn binary_row(sequence: u8) -> Vec<u8> {
+    packet(sequence, &[0x00, 0x00, 7, 0, 0, 0])
+}
+
+fn expected_full_auth_message() -> Vec<u8> {
+    let mut message = Vec::with_capacity(7);
+    for (index, byte) in b"secret".iter().enumerate() {
+        message.push(*byte ^ NONCE[index % NONCE.len()]);
+    }
+    message.push(0);
+    message
 }
 
 fn oversized_header(sequence: u8) -> Vec<u8> {
@@ -389,7 +517,44 @@ fn hex_bytes(text: &str) -> Vec<u8> {
         .collect()
 }
 
+fn packet_body(frame: &[u8]) -> &[u8] {
+    let length =
+        usize::from(frame[0]) | (usize::from(frame[1]) << 8) | (usize::from(frame[2]) << 16);
+    assert_eq!(length + 4, frame.len(), "packet length excludes its header");
+    &frame[4..]
+}
+
+fn command_body(frame: &[u8], command: u8) -> &[u8] {
+    assert_eq!(frame[3], 0, "command packet sequence id");
+    let body = packet_body(frame);
+    assert_eq!(body.first(), Some(&command), "command byte");
+    &body[1..]
+}
+
 fn assert_handshake_response(frame: &[u8], expected_capabilities: u32) {
+    assert_handshake_response_with(
+        frame,
+        expected_capabilities,
+        NATIVE_PLUGIN,
+        EXPECTED_SCRAMBLE,
+    );
+}
+
+fn assert_caching_handshake_response(frame: &[u8], expected_capabilities: u32) {
+    assert_handshake_response_with(
+        frame,
+        expected_capabilities,
+        CACHING_PLUGIN,
+        EXPECTED_CACHING_SCRAMBLE,
+    );
+}
+
+fn assert_handshake_response_with(
+    frame: &[u8],
+    expected_capabilities: u32,
+    expected_plugin: &str,
+    expected_scramble: &str,
+) {
     assert!(
         frame.len() > 36,
         "HandshakeResponse41 must have a 32-byte prefix"
@@ -412,11 +577,11 @@ fn assert_handshake_response(frame: &[u8], expected_capabilities: u32) {
     assert_eq!(read_cstring(body, &mut position), "alice");
     let auth_len = usize::from(body[position]);
     let auth = &body[position + 1..position + 1 + auth_len];
-    let expected = hex_bytes(EXPECTED_SCRAMBLE);
-    assert_eq!(auth, expected.as_slice(), "mysql_native_password scramble");
+    let expected = hex_bytes(expected_scramble);
+    assert_eq!(auth, expected.as_slice(), "authentication scramble");
     position += 1 + auth_len;
     assert_eq!(read_cstring(body, &mut position), "opurom");
-    assert_eq!(read_cstring(body, &mut position), NATIVE_PLUGIN);
+    assert_eq!(read_cstring(body, &mut position), expected_plugin);
     assert_eq!(
         position,
         body.len(),
@@ -689,7 +854,7 @@ fn mysql_unsupported_auth_plugins_are_rejected() {
     let server = MockServer::spawn(one_shot(handshake(
         0,
         SERVER_CAPS,
-        "caching_sha2_password",
+        UNSUPPORTED_PLUGIN,
         &NONCE,
     )));
     let address = server.address();
@@ -699,7 +864,7 @@ fn mysql_unsupported_auth_plugins_are_rejected() {
     });
     let text = error.to_string();
     assert!(text.contains("UNSUPPORTED"), "{text}");
-    assert!(text.contains("caching_sha2_password"), "{text}");
+    assert!(text.contains(UNSUPPORTED_PLUGIN), "{text}");
     let captured = server.finish();
     assert!(
         captured.handshake_response.is_empty(),
@@ -708,7 +873,7 @@ fn mysql_unsupported_auth_plugins_are_rejected() {
 
     let server = MockServer::spawn(scenario(
         handshake(0, SERVER_CAPS, NATIVE_PLUGIN, &NONCE),
-        auth_switch_packet(2, "caching_sha2_password"),
+        auth_switch_packet(2, UNSUPPORTED_PLUGIN, &NONCE),
         Vec::new(),
     ));
     let address = server.address();
@@ -718,9 +883,13 @@ fn mysql_unsupported_auth_plugins_are_rejected() {
     });
     let text = error.to_string();
     assert!(text.contains("UNSUPPORTED"), "{text}");
-    assert!(text.contains("caching_sha2_password"), "{text}");
+    assert!(text.contains(UNSUPPORTED_PLUGIN), "{text}");
     let captured = server.finish();
     assert_handshake_response(&captured.handshake_response, negotiated(SERVER_CAPS));
+    assert!(
+        captured.queries.is_empty(),
+        "no credentials are sent for an unsupported auth switch"
+    );
 }
 
 #[test]
@@ -767,4 +936,213 @@ fn mysql_deprecated_eof_ok_packets_are_parsed() {
             .insert("title", Value::Text("x".to_string()))
             .insert("done", Value::Bool(false))
     );
+}
+
+#[test]
+fn mysql_caching_sha2_fast_auth_conformance() {
+    let mut auth_success = auth_more_data(2, &[0x03]);
+    auth_success.extend_from_slice(&ok_packet(3, 0x00, 2));
+    let server = ScriptedServer::spawn(vec![
+        Step::Send(handshake(0, SERVER_CAPS, CACHING_PLUGIN, &NONCE)),
+        Step::Receive(Some(auth_success)),
+        Step::Receive(Some(ok_packet(1, 0x00, 2))),
+    ]);
+    let address = server.address();
+    let plugin = bounded("mysql caching_sha2 fast auth client", move || {
+        let mut db =
+            MySqlConnection::connect("127.0.0.1", address.port(), "alice", "secret", "opurom")
+                .expect("caching_sha2_password fast auth must succeed");
+        assert_eq!(db.auth_plugin(), CACHING_PLUGIN);
+        Database::exec(&mut db, "SELECT 1;").expect("connection must enter command phase");
+        db.auth_plugin().to_string()
+    });
+    assert_eq!(plugin, CACHING_PLUGIN);
+    let frames = server.finish();
+    assert_eq!(frames.len(), 2);
+    assert_caching_handshake_response(&frames[0], negotiated(SERVER_CAPS));
+    assert_eq!(query_sql(&frames[1]), "SELECT 1;");
+}
+
+#[test]
+fn mysql_caching_sha2_auth_switch_conformance() {
+    let mut auth_success = auth_more_data(4, &[0x03]);
+    auth_success.extend_from_slice(&ok_packet(5, 0x00, 2));
+    let server = ScriptedServer::spawn(vec![
+        Step::Send(handshake(0, SERVER_CAPS, NATIVE_PLUGIN, &NONCE)),
+        Step::Receive(Some(auth_switch_packet(2, CACHING_PLUGIN, &NONCE))),
+        Step::Receive(Some(auth_success)),
+        Step::Receive(Some(ok_packet(1, 0x00, 2))),
+    ]);
+    let address = server.address();
+    let plugin = bounded("mysql caching_sha2 auth switch client", move || {
+        let mut db =
+            MySqlConnection::connect("127.0.0.1", address.port(), "alice", "secret", "opurom")
+                .expect("auth switch to caching_sha2_password must succeed");
+        assert_eq!(db.auth_plugin(), CACHING_PLUGIN);
+        Database::exec(&mut db, "SELECT 1;").expect("connection must enter command phase");
+        db.auth_plugin().to_string()
+    });
+    assert_eq!(plugin, CACHING_PLUGIN);
+    let frames = server.finish();
+    assert_eq!(frames.len(), 3);
+    assert_handshake_response(&frames[0], negotiated(SERVER_CAPS));
+    assert_eq!(frames[1][3], 3, "AuthSwitchResponse sequence id");
+    assert_eq!(
+        packet_body(&frames[1]),
+        hex_bytes(EXPECTED_CACHING_SCRAMBLE).as_slice()
+    );
+    assert_eq!(query_sql(&frames[2]), "SELECT 1;");
+}
+
+#[test]
+fn mysql_caching_sha2_full_auth_rsa_oaep_conformance() {
+    let server = ScriptedServer::spawn(vec![
+        Step::Send(handshake(0, SERVER_CAPS, CACHING_PLUGIN, &NONCE)),
+        Step::Receive(Some(auth_more_data(2, &[0x04]))),
+        Step::Receive(Some(auth_more_data(
+            4,
+            mysql_crypto::TEST_PUBLIC_KEY_PEM.as_bytes(),
+        ))),
+        Step::Receive(Some(ok_packet(6, 0x00, 2))),
+        Step::Receive(Some(ok_packet(1, 0x00, 2))),
+    ]);
+    let address = server.address();
+    bounded("mysql caching_sha2 full auth client", move || {
+        let mut db =
+            MySqlConnection::connect("127.0.0.1", address.port(), "alice", "secret", "opurom")
+                .expect("caching_sha2_password RSA-OAEP full auth must succeed");
+        assert_eq!(db.auth_plugin(), CACHING_PLUGIN);
+        Database::exec(&mut db, "SELECT 1;").expect("connection must enter command phase");
+    });
+    let frames = server.finish();
+    assert_eq!(frames.len(), 4);
+    assert_caching_handshake_response(&frames[0], negotiated(SERVER_CAPS));
+    assert_eq!(frames[1][3], 3, "public-key request sequence id");
+    assert_eq!(packet_body(&frames[1]), &[0x02]);
+    assert_eq!(frames[2][3], 5, "encrypted password sequence id");
+    let ciphertext = packet_body(&frames[2]);
+    assert_eq!(ciphertext.len(), 64, "512-bit RSA ciphertext length");
+    let plaintext = mysql_crypto::decrypt_oaep_sha1(
+        ciphertext,
+        &hex_bytes(mysql_crypto::TEST_MODULUS_HEX),
+        &hex_bytes(mysql_crypto::TEST_PRIVATE_EXPONENT_HEX),
+    )
+    .expect("RSA-OAEP ciphertext must decrypt with the test private key");
+    assert_eq!(plaintext, expected_full_auth_message());
+    assert_eq!(query_sql(&frames[3]), "SELECT 1;");
+}
+
+#[test]
+fn mysql_stmt_prepare_execute_conformance() {
+    let sql = "SELECT id FROM Todo WHERE id = ? AND title = ?";
+    let mut prepare_reply = prepare_ok_packet(1, 7, 0, 2, 0);
+    prepare_reply.extend_from_slice(&column_definition(2, "?", TYPE_LONG, 11));
+    prepare_reply.extend_from_slice(&column_definition(3, "?", TYPE_VARCHAR, 64));
+    prepare_reply.extend_from_slice(&eof_packet(4, 2));
+    let server = ScriptedServer::spawn(vec![
+        Step::Send(handshake(0, SERVER_CAPS, NATIVE_PLUGIN, &NONCE)),
+        Step::Receive(Some(ok_packet(2, 0x00, 2))),
+        Step::Receive(Some(prepare_reply)),
+        Step::Receive(Some(ok_packet(1, 0x00, 2))),
+    ]);
+    let address = server.address();
+    let statement = bounded("mysql stmt prepare client", move || {
+        let mut db =
+            MySqlConnection::connect("127.0.0.1", address.port(), "alice", "secret", "opurom")
+                .expect("handshake must succeed");
+        let statement = db.prepare(sql).expect("COM_STMT_PREPARE OK must parse");
+        db.execute_stmt(statement, &[Value::Int(7), Value::Text("x".to_string())])
+            .expect("COM_STMT_EXECUTE OK must parse");
+        statement
+    });
+    assert_eq!(statement.id(), 7);
+    assert_eq!(statement.column_count(), 0);
+    assert_eq!(statement.param_count(), 2);
+    assert_eq!(statement.warning_count(), 0);
+    let frames = server.finish();
+    assert_eq!(frames.len(), 3);
+    assert_handshake_response(&frames[0], negotiated(SERVER_CAPS));
+    assert_eq!(command_body(&frames[1], COM_STMT_PREPARE), sql.as_bytes());
+    let mut expected = vec![7, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+    expected.extend_from_slice(&[TYPE_LONGLONG, 0, TYPE_STRING, 0]);
+    expected.extend_from_slice(&7i64.to_le_bytes());
+    expected.extend_from_slice(&[1, b'x']);
+    assert_eq!(
+        command_body(&frames[2], COM_STMT_EXECUTE),
+        expected.as_slice()
+    );
+}
+
+#[test]
+fn mysql_stmt_prepare_err_and_truncated_packets_are_rejected() {
+    let server = ScriptedServer::spawn(vec![
+        Step::Send(handshake(0, SERVER_CAPS, NATIVE_PLUGIN, &NONCE)),
+        Step::Receive(Some(ok_packet(2, 0x00, 2))),
+        Step::Receive(Some(err_packet(1, 1064, "42000", "prepare failed"))),
+    ]);
+    let address = server.address();
+    let error = bounded("mysql prepare ERR client", move || {
+        let mut db =
+            MySqlConnection::connect("127.0.0.1", address.port(), "alice", "secret", "opurom")
+                .expect("handshake must succeed");
+        db.prepare("SELECT ?").unwrap_err()
+    });
+    assert_eq!(error.mysql_code(), Some(1064));
+    assert_eq!(error.sqlstate(), Some("42000"));
+    assert_eq!(error.mysql_error_kind(), Some(MySqlErrorKind::Syntax));
+    server.finish();
+
+    let full_reply = prepare_ok_packet(1, 7, 0, 0, 0);
+    let truncated_reply = full_reply[..6].to_vec();
+    let server = ScriptedServer::spawn(vec![
+        Step::Send(handshake(0, SERVER_CAPS, NATIVE_PLUGIN, &NONCE)),
+        Step::Receive(Some(ok_packet(2, 0x00, 2))),
+        Step::Receive(Some(truncated_reply)),
+    ]);
+    let address = server.address();
+    let error = bounded("mysql truncated prepare client", move || {
+        let mut db =
+            MySqlConnection::connect("127.0.0.1", address.port(), "alice", "secret", "opurom")
+                .expect("handshake must succeed");
+        db.prepare("SELECT 1").unwrap_err()
+    });
+    assert!(error.to_string().contains("truncated"), "{error}");
+    server.finish();
+}
+
+#[test]
+fn mysql_stmt_execute_binary_result_is_typed_unsupported() {
+    let mut prepare_reply = prepare_ok_packet(1, 9, 1, 0, 0);
+    prepare_reply.extend_from_slice(&column_definition(2, "id", TYPE_LONG, 11));
+    prepare_reply.extend_from_slice(&eof_packet(3, 2));
+    let mut binary_result = packet(1, &[1]);
+    binary_result.extend_from_slice(&column_definition(2, "id", TYPE_LONG, 11));
+    binary_result.extend_from_slice(&eof_packet(3, 2));
+    binary_result.extend_from_slice(&binary_row(4));
+    binary_result.extend_from_slice(&eof_packet(5, 2));
+    let server = ScriptedServer::spawn(vec![
+        Step::Send(handshake(0, SERVER_CAPS, NATIVE_PLUGIN, &NONCE)),
+        Step::Receive(Some(ok_packet(2, 0x00, 2))),
+        Step::Receive(Some(prepare_reply)),
+        Step::Receive(Some(binary_result)),
+        Step::Receive(Some(ok_packet(1, 0x00, 2))),
+    ]);
+    let address = server.address();
+    let error = bounded("mysql binary result client", move || {
+        let mut db =
+            MySqlConnection::connect("127.0.0.1", address.port(), "alice", "secret", "opurom")
+                .expect("handshake must succeed");
+        let statement = db
+            .prepare("SELECT id FROM Todo")
+            .expect("COM_STMT_PREPARE OK must parse");
+        let error = db.execute_stmt(statement, &[]).unwrap_err();
+        Database::exec(&mut db, "SELECT 1;").expect("connection remains usable after UNSUPPORTED");
+        error
+    });
+    let text = error.to_string();
+    assert!(text.contains("UNSUPPORTED"), "{text}");
+    assert!(text.contains("binary"), "{text}");
+    let frames = server.finish();
+    assert_eq!(frames.len(), 4);
+    assert_eq!(query_sql(&frames[3]), "SELECT 1;");
 }

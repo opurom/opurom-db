@@ -13,6 +13,7 @@ mod kv;
 mod memory;
 mod model;
 mod mysql;
+mod mysql_crypto;
 mod pg;
 mod pgserver;
 mod pool;
@@ -34,7 +35,7 @@ pub use model::{
     create_table_sql, migration_files, parse_models, parse_models_value, schema_sql, sql_literal,
     validate_ident, validate_model, write_migrations, Field, FieldType, Model,
 };
-pub use mysql::MySqlConnection;
+pub use mysql::{MySqlConnection, MySqlStatement};
 pub use pg::PgConnection;
 pub use pgserver::{PgAuth, PgServer, PgServerOptions, PgTls};
 pub use pool::PooledDb;
