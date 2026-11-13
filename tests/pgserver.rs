@@ -2,8 +2,8 @@
 //! server over real TCP sockets, with and without TLS.
 
 use opurom_db::{
-    create, create_table, delete, get, list, parse_models, update, PgAuth, PgConnection, PgServer,
-    PgServerOptions, PgTls, Value,
+    create, create_table, delete, get, list, parse_models, update, Database, PgAuth, PgConnection,
+    PgServer, PgServerOptions, PgTls, Value,
 };
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -353,5 +353,34 @@ fn bundled_server_keeps_the_connection_usable_after_an_error() {
         assert!(error.to_string().contains("42P01"));
         db.exec("CREATE TABLE Todo (id INTEGER PRIMARY KEY);")
             .expect("create table after an error");
+    });
+}
+#[test]
+fn bundled_server_runs_transactions_through_the_database_guard() {
+    let server = plain_server();
+    let port = server.port();
+    bounded("transaction guard client", move || {
+        let mut db = PgConnection::connect("127.0.0.1", port, "alice", "opurom")
+            .expect("plain connection to the bundled server");
+        db.exec("CREATE TABLE Note (id INTEGER PRIMARY KEY, body TEXT);")
+            .expect("create table");
+
+        // Committed through the guard: the row survives.
+        let mut tx = db.transaction().expect("begin via the Database guard");
+        tx.exec("INSERT INTO Note (id, body) VALUES (1, 'kept');")
+            .expect("insert inside the guard");
+        tx.commit().expect("commit via the guard");
+        let rows = db.query("SELECT * FROM Note;").expect("select");
+        assert_eq!(rows.len(), 1);
+
+        // Rolled back by dropping the guard: the row never appears.
+        {
+            let mut tx = db.transaction().expect("begin again");
+            tx.exec("INSERT INTO Note (id, body) VALUES (2, 'discarded');")
+                .expect("insert inside the second guard");
+        }
+        let rows = db.query("SELECT * FROM Note;").expect("select again");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("body"), Some(&Value::Text("kept".to_string())));
     });
 }

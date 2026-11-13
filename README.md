@@ -24,6 +24,8 @@ pub trait Database {
     // Kv/Memory/PgConnection/MySqlConnection substitute safely quoted literals.
     fn exec_params(&mut self, sql: &str, params: &[Value]) -> Result<(), DbError>;
     fn query_params(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError>;
+
+    fn transaction(&mut self) -> Result<Transaction<'_, Self>, DbError> where Self: Sized;
 }
 ```
 
@@ -56,6 +58,8 @@ pub trait Database {
 | `Value::{Int(i64), Text(String), Bool(bool)}` | `as_i64` / `as_str` / `as_bool` |
 | `Row::get(&str) -> Option<&Value>` | plus `Row::new()`, `insert`, `set`, `columns`, `len`, `is_empty` |
 | `DbError` | `Display`, `Debug`, `std::error::Error`; driver message, optional `sqlstate()`, `mysql_code()` and `mysql_error_kind()` |
+| `Database::transaction()` | sends `BEGIN` and returns a guard; statements run through the guard, whose drop rolls back an open transaction |
+| `Transaction::commit()` / `rollback()` | explicit `COMMIT` / `ROLLBACK`; both release the driver borrow |
 
 `Row::insert(name, value)` works both in place (`let mut r = Row::new();
 r.insert(...);`) and as a builder (`Row::new().insert(...).insert(...)`);
@@ -108,8 +112,8 @@ the Mutex. A poisoned Mutex is recovered because the SQLite handle remains
 usable and later calls still hold the same guard.
 
 This is one shared connection, not a sized pool of independent connections. It
-does not add transactions, authentication, TLS, connection pool sizing, or
-distributed coordination. The server-side rate limit and structured request
+does not add authentication, TLS, connection pool sizing, or distributed
+coordination. The server-side rate limit and structured request
 log live in `opurom-server` (`OPR_RATE_LIMIT` and `OPR_LOG_JSON`); this crate
 only supplies the shared handle.
 
@@ -128,6 +132,26 @@ only supplies the shared handle.
   exposed as their text representation.
 - Malformed IR, bad queries, and invalid identifiers produce a readable
   `DbError`; nothing panics on a bad query.
+
+## Transactions
+
+```rust
+let mut tx = db.transaction()?;                    // BEGIN
+create(&mut *tx, &model, &[("title", "x".into())])?; // statements run through the guard
+tx.commit()?;                                      // COMMIT; tx.rollback() sends ROLLBACK
+```
+
+`Database::transaction()` sends `BEGIN` and returns a `Transaction` guard that
+derefs to the driver, so the whole `Database` API, including the CRUD helpers
+and bound parameters, works inside the transaction. `commit` and `rollback`
+close it explicitly; a guard dropped while still open sends `ROLLBACK`, so an
+early return or unwind cannot leave writes half-applied. When the driver
+rejects the commit the guard stays open, so dropping it still attempts the
+rollback. A second `BEGIN` on a connection that already has an open
+transaction returns the driver's error (`cannot start a transaction within a
+transaction` on SQLite). The trait default works for any driver whose `exec`
+accepts the transaction SQL: `Kv` and `Memory` reject `BEGIN`, so
+`transaction()` fails there with a readable error.
 
 ## Drivers
 
@@ -183,10 +207,11 @@ Binary-format columns are rejected. Duplicate column names collapse in
 `Row`. Floats, numerics, dates, arrays and JSON have no dedicated `Value`
 variant and are returned as text. There is no password or SCRAM/MD5
 authentication, no prepared statements, no connection pooling, no
-transaction API, no COPY protocol and no binary result decoding. A 500 ms
-per-address connect timeout, write deadline and response deadline, a 16 MiB
-frame and cumulative response budget, a 65,536-row cap and a 1,600-column
-cap bound memory and waiting.
+COPY protocol and no binary result decoding. Transactions use the generic
+`Database::transaction()` guard, which sends `BEGIN` / `COMMIT` / `ROLLBACK`
+as simple `Query` messages. A 500 ms per-address connect timeout, write
+deadline and response deadline, a 16 MiB frame and cumulative response
+budget, a 65,536-row cap and a 1,600-column cap bound memory and waiting.
 
 ### MySQL v10 (`MySqlConnection`)
 
@@ -358,13 +383,15 @@ cargo fmt --all
 cargo test
 ```
 
-Fifteen integration tests cover the core: SQLite CRUD round-trip against a
+Twenty integration tests cover the core: SQLite CRUD round-trip against a
 temp file, deterministic pagination across repeated runs and insertion orders,
 native parameter binding with quotes, KV persistence across two
 opens, KV and Memory CRUD, migration SQL content and idempotency, malformed
 IR rejection, SQL injection on identifiers, empty-model migrations, the
-`opurom-migrate` binary, the `Row` / `Value` helpers, and eight threads
-sharing one `PooledDb` for insert/read/update/delete.
+`opurom-migrate` binary, the `Row` / `Value` helpers, eight threads
+sharing one `PooledDb` for insert/read/update/delete, and five SQLite
+transaction cases (commit, explicit rollback, rollback on drop, a failed
+commit and nested `BEGIN` rejection).
 
 Eight tests in `tests/pg_protocol.rs` cover a loopback mock server: startup
 and `Query` framing, `ParameterStatus` / `BackendKeyData` parsing, a two-row
@@ -375,7 +402,7 @@ cleartext/MD5/SASL authentication, an exact 16-byte `CancelRequest` on a
 separate socket with the query connection still usable, and cancellation
 rejection when startup omitted `BackendKeyData`.
 
-Eleven tests in `tests/pgserver.rs` run the client against the bundled
+Twelve tests in `tests/pgserver.rs` run the client against the bundled
 server over real sockets: a multi-statement `BEGIN` / `INSERT` / `SELECT` /
 `COMMIT` transaction whose committed row survives (both as separate round
 trips and as one Query message), a `ROLLBACK` transaction whose row does not,
@@ -386,7 +413,9 @@ and refused by the client, a TLS session with a trusted self-signed
 certificate that runs a full transaction over the encrypted stream, the
 rejection of an untrusted self-signed certificate, the rejection of a
 certificate that does not chain to the supplied anchor, a plaintext server
-that refuses TLS, and a session that stays usable after a failed statement.
+that refuses TLS, a session that stays usable after a failed statement, and
+the `Database::transaction()` guard committing and rolling back over a real
+socket.
 
 Fourteen integration tests in `tests/mysql_protocol.rs` speak real MySQL
 v10 bytes against loopback mock servers: the eight core cases (handshake with the
@@ -401,8 +430,8 @@ SHA-256 known-answer vectors, the native-password scramble, the real MySQL 8.0
 fast-auth scramble, a deterministic RSA-OAEP ciphertext, and bounded statement
 framing.
 
-`cargo test --offline` runs 47 integration tests, 8 unit tests and 0 doc
-tests (55 total). `cargo fmt --all` and
+`cargo test --offline` runs 54 integration tests, 8 unit tests and 0 doc
+tests (62 total). `cargo fmt --all` and
 `RUSTFLAGS="-D warnings" cargo test --offline` pass with zero warnings. Sockets
 bind to `127.0.0.1` on ephemeral ports and every server runs on background
 threads of the test process, so no external PostgreSQL or MySQL server is
@@ -412,7 +441,8 @@ contacted and no server process is left running.
 
 Verified: SQLite via FFI on macOS/Linux, embedded file-backed KV, in-memory
 store, typed CRUD helpers, deterministic/idempotent migration SQL, identifier
-validation, parameter binding, a Mutex-serialized shared SQLite handle with a
+validation, parameter binding, explicit transactions with a guard that rolls
+back on drop, a Mutex-serialized shared SQLite handle with a
 threaded CRUD test, `opurom-db` library and `opurom-migrate` binary. Also
 verified against a local TCP mock: PostgreSQL v3 startup and simple-query
 framing, typed text rows, readable errors, unsupported-auth rejection,
