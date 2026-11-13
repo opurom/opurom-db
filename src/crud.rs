@@ -5,6 +5,7 @@ use crate::{
     create_table_sql, validate_ident, validate_model, Database, DbError, Field, FieldType, Model,
     Row, Value,
 };
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 /// Create the model's table if it does not exist yet.
@@ -120,6 +121,68 @@ pub fn list<D: Database + ?Sized>(db: &mut D, model: &Model) -> Result<Vec<Row>,
     validate_model(model)?;
     let rows = db.query(&format!("SELECT * FROM {};", model.name))?;
     Ok(rows.into_iter().map(|r| normalize(model, r)).collect())
+}
+
+/// Upper bound for one page of [`list_paged`].
+pub const MAX_PAGE_LIMIT: i64 = 1000;
+
+/// Deterministic pagination over `model`'s rows, ascending by primary key.
+///
+/// Rows are fetched with the same `SELECT *` as [`list`] and sorted and sliced
+/// here rather than in SQL, so every driver — including the KV/memory subset
+/// without `ORDER BY`/`LIMIT` — returns pages independent of insertion timing.
+/// `limit` must be in `1..=MAX_PAGE_LIMIT` and `offset` non-negative; both
+/// bounds return a readable [`DbError`]. Requires a primary field, like
+/// [`get`]/[`update`]/[`delete`].
+pub fn list_paged<D: Database + ?Sized>(
+    db: &mut D,
+    model: &Model,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Row>, DbError> {
+    validate_model(model)?;
+    if limit <= 0 {
+        return Err(DbError::new(format!(
+            "limit must be a positive integer, got {limit}"
+        )));
+    }
+    if limit > MAX_PAGE_LIMIT {
+        return Err(DbError::new(format!(
+            "limit {limit} exceeds the maximum page size {MAX_PAGE_LIMIT}"
+        )));
+    }
+    if offset < 0 {
+        return Err(DbError::new(format!(
+            "offset must be non-negative, got {offset}"
+        )));
+    }
+    let pk = require_primary(model)?;
+    let mut rows = db.query(&format!("SELECT * FROM {};", model.name))?;
+    rows.sort_by(|a, b| cmp_pk_cells(a.get(&pk.name), b.get(&pk.name)));
+    let skip = usize::try_from(offset).unwrap_or(usize::MAX);
+    Ok(rows
+        .into_iter()
+        .skip(skip)
+        .take(limit as usize)
+        .map(|r| normalize(model, r))
+        .collect())
+}
+
+/// Total order over primary-key cells; a missing cell sorts first, like a
+/// SQL NULL. A primary-key column has one declared type, so mixed variants
+/// fall back to equal.
+fn cmp_pk_cells(a: Option<&Value>, b: Option<&Value>) -> Ordering {
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(x), Some(y)) => match (x, y) {
+            (Value::Int(u), Value::Int(v)) => u.cmp(v),
+            (Value::Text(u), Value::Text(v)) => u.cmp(v),
+            (Value::Bool(u), Value::Bool(v)) => u.cmp(v),
+            _ => Ordering::Equal,
+        },
+    }
 }
 
 /// `id` accepts any type convertible into Value (i64, i32, &str, String, bool, Value).

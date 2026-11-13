@@ -365,6 +365,123 @@ fn sqlite_crud_binding_blocks_query_structure_injection() {
     assert_eq!(tables.len(), 1, "the table must survive every attempt");
 }
 
+fn paged_todo_ids<D: Database + ?Sized>(db: &mut D, model: &Model, page: i64) -> Vec<i64> {
+    list_paged(db, model, 10, page * 10)
+        .unwrap()
+        .iter()
+        .map(|r| r.get("id").unwrap().as_i64().unwrap())
+        .collect()
+}
+
+#[test]
+fn list_paged_paginates_identically_across_runs() {
+    let model = todo_model();
+    let dir = TempDir::new("list-paged");
+    let db_path = dir.path().join("a.sqlite");
+    let mut db = Sqlite::open(db_path.to_str().unwrap()).unwrap();
+    create_table(&mut db, &model).unwrap();
+    // Descending ids: page order must come from the primary key, not insertion.
+    for i in (1..=25).rev() {
+        create(
+            &mut db,
+            &model,
+            &[
+                ("id", Value::Int(i)),
+                ("title", Value::Text(format!("task {i}"))),
+            ],
+        )
+        .unwrap();
+    }
+
+    let expected: Vec<i64> = (1..=25).collect();
+    let first: Vec<i64> = (0..3)
+        .flat_map(|p| paged_todo_ids(&mut db, &model, p))
+        .collect();
+    assert_eq!(first, expected, "25 rows at limit 10 cover ids in pk order");
+    // A repeated walk over the same database returns the identical sequence.
+    let again: Vec<i64> = (0..3)
+        .flat_map(|p| paged_todo_ids(&mut db, &model, p))
+        .collect();
+    assert_eq!(again, expected, "pagination must be identical across runs");
+
+    assert_eq!(
+        paged_todo_ids(&mut db, &model, 2),
+        vec![21, 22, 23, 24, 25],
+        "final page is partial"
+    );
+    assert!(
+        list_paged(&mut db, &model, 10, 25).unwrap().is_empty(),
+        "offset one past the end yields an empty page"
+    );
+    // limit/offset bounds return readable errors.
+    for (limit, offset, mention) in [
+        (0, 0, "positive integer"),
+        (-3, 0, "positive integer"),
+        (MAX_PAGE_LIMIT + 1, 0, "maximum page size"),
+        (10, -1, "non-negative"),
+    ] {
+        let err = list_paged(&mut db, &model, limit, offset).unwrap_err();
+        assert!(
+            err.message().contains(mention),
+            "unexpected error for ({limit}, {offset}): {err}"
+        );
+    }
+    assert_eq!(
+        list_paged(&mut db, &model, MAX_PAGE_LIMIT, 0)
+            .unwrap()
+            .len(),
+        25,
+        "the page-size cap itself is usable"
+    );
+    // Stable ordering needs a primary field, like get/update/delete.
+    let no_pk = Model {
+        name: "Blob".to_string(),
+        fields: vec![Field {
+            name: "note".to_string(),
+            ty: FieldType::Text,
+            primary: false,
+            default: None,
+        }],
+    };
+    let err = list_paged(&mut db, &no_pk, 10, 0).unwrap_err();
+    assert!(
+        err.message().contains("no primary field"),
+        "unexpected error: {err}"
+    );
+
+    // A second temp database with a different insertion order paginates the same.
+    let dir2 = TempDir::new("list-paged-odd-even");
+    let db_path2 = dir2.path().join("b.sqlite");
+    let mut db2 = Sqlite::open(db_path2.to_str().unwrap()).unwrap();
+    create_table(&mut db2, &model).unwrap();
+    for i in (1..=25).step_by(2) {
+        create(
+            &mut db2,
+            &model,
+            &[
+                ("id", Value::Int(i)),
+                ("title", Value::Text(format!("task {i}"))),
+            ],
+        )
+        .unwrap();
+    }
+    for i in (2..=24).rev().step_by(2) {
+        create(
+            &mut db2,
+            &model,
+            &[
+                ("id", Value::Int(i)),
+                ("title", Value::Text(format!("task {i}"))),
+            ],
+        )
+        .unwrap();
+    }
+    let shuffled: Vec<i64> = (0..3)
+        .flat_map(|p| paged_todo_ids(&mut db2, &model, p))
+        .collect();
+    assert_eq!(shuffled, expected, "insertion timing must not change pages");
+}
+
 #[test]
 fn kv_persistence_across_two_opens() {
     let dir = TempDir::new("kv-persist");
