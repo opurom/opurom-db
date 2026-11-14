@@ -114,5 +114,6 @@ fn related_model(relation: &crate::Relation) -> Model {
             default: None,
         }],
         relations: Vec::new(),
+        indexes: Vec::new(),
     }
 }

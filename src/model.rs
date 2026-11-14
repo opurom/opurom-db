@@ -1,4 +1,4 @@
-use crate::{DbError, Value};
+use crate::{DbError, IndexErrorKind, Value};
 use serde_json::Value as Json;
 use std::collections::BTreeSet;
 use std::fs;
@@ -56,6 +56,16 @@ pub struct Relation {
     pub parent: String,
 }
 
+/// A table index over one or more declared model columns. `name` is the SQL
+/// index name and must be unique across the generated schema; `unique` adds a
+/// uniqueness constraint. All names are validated before SQL generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Index {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Model {
     pub name: String,
@@ -63,6 +73,9 @@ pub struct Model {
     /// Foreign-key relations declared on this model. Empty by default; use
     /// `relation` to declare one, and [`crate::with_related`] to eager load.
     pub relations: Vec<Relation>,
+    /// Indexes created with the table. Empty by default; use [`Model::index`]
+    /// or the IR `indexes` array to declare them.
+    pub indexes: Vec<Index>,
 }
 
 impl Model {
@@ -150,10 +163,23 @@ impl Model {
                 });
             }
         }
+        let mut indexes = Vec::new();
+        if let Some(value) = obj.get("indexes") {
+            let entries = value.as_array().ok_or_else(|| {
+                index_error(
+                    IndexErrorKind::InvalidDeclaration,
+                    format!("model {name:?} has a non-array 'indexes' field"),
+                )
+            })?;
+            for entry in entries {
+                indexes.push(index_from_ir(name, entry)?);
+            }
+        }
         let model = Model {
             name: name.to_string(),
             fields,
             relations,
+            indexes,
         };
         validate_model(&model)?;
         Ok(model)
@@ -175,6 +201,72 @@ pub fn validate_ident(name: &str) -> Result<(), DbError> {
     } else {
         Err(DbError::new(format!("invalid SQL identifier: {name:?}")))
     }
+}
+
+fn index_error(kind: IndexErrorKind, message: impl Into<String>) -> DbError {
+    DbError::with_index_error(kind, message)
+}
+
+fn index_from_ir(model: &str, value: &Json) -> Result<Index, DbError> {
+    let obj = value.as_object().ok_or_else(|| {
+        index_error(
+            IndexErrorKind::InvalidDeclaration,
+            format!("index of model {model:?} must be a JSON object"),
+        )
+    })?;
+    let name = obj.get("name").and_then(Json::as_str).ok_or_else(|| {
+        index_error(
+            IndexErrorKind::InvalidDeclaration,
+            format!("index of model {model:?} is missing a string 'name'"),
+        )
+    })?;
+    let columns = obj.get("columns").and_then(Json::as_array).ok_or_else(|| {
+        index_error(
+            IndexErrorKind::InvalidDeclaration,
+            format!("index {name:?} of model {model:?} is missing a 'columns' array"),
+        )
+    })?;
+    let mut parsed_columns = Vec::with_capacity(columns.len());
+    for column in columns {
+        let column = column.as_str().ok_or_else(|| {
+            index_error(
+                IndexErrorKind::InvalidDeclaration,
+                format!("index {name:?} of model {model:?} has a non-string column"),
+            )
+        })?;
+        parsed_columns.push(column.to_string());
+    }
+    let unique = match obj.get("unique") {
+        None | Some(Json::Null) => false,
+        Some(Json::Bool(b)) => *b,
+        Some(_) => {
+            return Err(index_error(
+                IndexErrorKind::InvalidDeclaration,
+                format!("index {name:?} of model {model:?} has a non-boolean 'unique'"),
+            ))
+        }
+    };
+    Ok(Index {
+        name: name.to_string(),
+        columns: parsed_columns,
+        unique,
+    })
+}
+
+fn validate_models(models: &[Model]) -> Result<(), DbError> {
+    let mut names = BTreeSet::new();
+    for model in models {
+        validate_model(model)?;
+        for index in &model.indexes {
+            if !names.insert(index.name.to_ascii_lowercase()) {
+                return Err(index_error(
+                    IndexErrorKind::DuplicateIndex,
+                    format!("index {:?} is declared by more than one model", index.name),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_model(model: &Model) -> Result<(), DbError> {
@@ -241,6 +333,72 @@ pub fn validate_model(model: &Model) -> Result<(), DbError> {
             )));
         }
     }
+    let mut index_names = BTreeSet::new();
+    let mut index_shapes = BTreeSet::new();
+    for index in &model.indexes {
+        validate_ident(&index.name)
+            .map_err(|e| index_error(IndexErrorKind::InvalidIdentifier, e.to_string()))?;
+        let name = index.name.to_ascii_lowercase();
+        if name.starts_with("sqlite_") {
+            return Err(index_error(
+                IndexErrorKind::InvalidIdentifier,
+                format!("index {:?} uses the reserved sqlite_ prefix", index.name),
+            ));
+        }
+        if !index_names.insert(name) {
+            return Err(index_error(
+                IndexErrorKind::DuplicateIndex,
+                format!(
+                    "model {:?} declares index {:?} more than once",
+                    model.name, index.name
+                ),
+            ));
+        }
+        if index.columns.is_empty() {
+            return Err(index_error(
+                IndexErrorKind::EmptyColumns,
+                format!(
+                    "index {:?} of model {:?} has no columns",
+                    index.name, model.name
+                ),
+            ));
+        }
+        let shape = index
+            .columns
+            .iter()
+            .map(|column| column.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(",");
+        if !index_shapes.insert(shape) {
+            return Err(index_error(
+                IndexErrorKind::DuplicateIndex,
+                format!(
+                    "model {:?} declares duplicate columns for index {:?}",
+                    model.name, index.name
+                ),
+            ));
+        }
+        let mut columns = BTreeSet::new();
+        for column in &index.columns {
+            validate_ident(column)
+                .map_err(|e| index_error(IndexErrorKind::InvalidIdentifier, e.to_string()))?;
+            if !columns.insert(column.to_ascii_lowercase()) {
+                return Err(index_error(
+                    IndexErrorKind::DuplicateColumn,
+                    format!("index {:?} repeats column {column:?}", index.name),
+                ));
+            }
+            if !model.fields.iter().any(|f| f.name == *column) {
+                return Err(index_error(
+                    IndexErrorKind::UnknownColumn,
+                    format!(
+                        "index {:?} of model {:?} names unknown column {column:?}",
+                        index.name, model.name
+                    ),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -251,6 +409,17 @@ impl Model {
         self.relations.push(Relation {
             field: field.to_string(),
             parent: parent.to_string(),
+        });
+        self
+    }
+
+    /// Declare an index over `columns`; `unique` adds a uniqueness constraint.
+    /// Names and columns are checked by [`validate_model`] before SQL is built.
+    pub fn index(mut self, name: &str, columns: &[&str], unique: bool) -> Model {
+        self.indexes.push(Index {
+            name: name.to_string(),
+            columns: columns.iter().map(|column| column.to_string()).collect(),
+            unique,
         });
         self
     }
@@ -330,6 +499,7 @@ pub fn parse_models_value(root: &Json) -> Result<Vec<Model>, DbError> {
         }
         models.push(model);
     }
+    validate_models(&models)?;
     Ok(models)
 }
 
@@ -339,7 +509,9 @@ pub fn parse_models(ir_json: &str) -> Result<Vec<Model>, DbError> {
     parse_models_value(&root)
 }
 
-/// Deterministic, idempotent `CREATE TABLE IF NOT EXISTS` statement.
+/// Deterministic, idempotent `CREATE TABLE IF NOT EXISTS` plus one
+/// `CREATE [UNIQUE] INDEX IF NOT EXISTS` per declared index. All identifiers
+/// are validated by [`validate_model`] before SQL text is produced.
 pub fn create_table_sql(model: &Model) -> Result<String, DbError> {
     validate_model(model)?;
     let mut out = format!("CREATE TABLE IF NOT EXISTS {} (\n", model.name);
@@ -361,10 +533,24 @@ pub fn create_table_sql(model: &Model) -> Result<String, DbError> {
         out.push('\n');
     }
     out.push_str(");\n");
+    for index in &model.indexes {
+        out.push_str(if index.unique {
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+        } else {
+            "CREATE INDEX IF NOT EXISTS "
+        });
+        out.push_str(&index.name);
+        out.push_str(" ON ");
+        out.push_str(&model.name);
+        out.push_str(" (");
+        out.push_str(&index.columns.join(", "));
+        out.push_str(");\n");
+    }
     Ok(out)
 }
 
 pub fn schema_sql(models: &[Model]) -> Result<String, DbError> {
+    validate_models(models)?;
     let mut out = String::new();
     for m in models {
         out.push_str(&create_table_sql(m)?);
@@ -374,9 +560,9 @@ pub fn schema_sql(models: &[Model]) -> Result<String, DbError> {
 
 /// `(filename, content)` pairs: `001_create_<lowercase model>.sql`, etc.
 pub fn migration_files(models: &[Model]) -> Result<Vec<(String, String)>, DbError> {
+    validate_models(models)?;
     let mut files = Vec::with_capacity(models.len());
     for (i, m) in models.iter().enumerate() {
-        validate_model(m)?;
         files.push((
             format!("{:03}_create_{}.sql", i + 1, m.name.to_ascii_lowercase()),
             create_table_sql(m)?,

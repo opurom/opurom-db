@@ -1,12 +1,12 @@
 # opurom-db
 
 Data layer for OPUROM: one `Database` trait over five drivers,
-typed IR-driven CRUD helpers, deterministic SQL migrations, a shared SQLite
-handle, a pure-std PostgreSQL v3 frontend, a TLS client plus a
-bundled PostgreSQL-protocol conformance server, and a pure-std MySQL
-protocol v10 frontend with `mysql_native_password`, MySQL 8.0
-`caching_sha2_password`, bounded prepared statements and a pure-Rust
-SHA-1/SHA-256/RSA-OAEP crypto helper.
+typed IR-driven CRUD helpers, deterministic SQL migrations with declared
+indexes and a pure index planner, a shared SQLite handle, a pure-std
+PostgreSQL v3 frontend, a TLS client plus a bundled PostgreSQL-protocol
+conformance server, and a pure-std MySQL protocol v10 frontend with
+`mysql_native_password`, MySQL 8.0 `caching_sha2_password`, bounded prepared
+statements and a pure-Rust SHA-1/SHA-256/RSA-OAEP crypto helper.
 Rust 1.99.1; PostgreSQL uses `std::net::TcpStream` and the pinned
 pure-Rust `rustls` 0.23.46 (no OpenSSL, no C toolchain: the `ring` provider is
 selected explicitly). SQLite is reached through direct FFI to the system
@@ -74,7 +74,13 @@ pub trait Database {
 | `Migrator::new(&mut db)` | creates `_migrations` if missing and returns a runner |
 | `Migrator::apply(&[Migration])` | applies pending versions in order, one transaction each; returns the newly applied versions |
 | `Migrator::applied()` | ascending versions already recorded in `_migrations` |
+| `Migration::from_model(version, model)` | one `up` body containing table and index DDL for one model |
 | `MigrationError` | typed: `MissingVersion`, `DuplicateVersion`, `AppliedAhead`, `Failed` |
+| `Index { name, columns, unique }` | one single- or multi-column index; `unique` is optional and defaults to `false` in IR |
+| `Model::index(name, columns, unique)` | builder form; names and columns are validated before SQL generation |
+| `Query::new(model, filters, table_rows)` | pure planner input: filter set, declared indexes and integer row estimate |
+| `explain(&Query) -> Plan` | chooses `Scan::TableScan` / `Scan::IndexScan`; `Plan` carries index, prefix length and integer `estimated_rows` |
+| `IndexErrorKind` / `DbError::index_error_kind()` | typed empty, unknown, duplicate, invalid-identifier and malformed declarations |
 | `Model::relation(field, parent)` | declares a `field -> parent.id` foreign-key relation |
 | `with_related(db, model, parents, field)` | eager loads all related rows in ONE query; `BTreeMap<i64, Vec<Row>>` plus dangling-FK `Vec<ForeignKeyViolation>` |
 | `Sqlite::executed_statements()` | monotonic count of statements run through the handle, for query-count tests |
@@ -146,6 +152,80 @@ orders produce byte-identical pages. `limit` must be `1..=MAX_PAGE_LIMIT`,
 `offset` non-negative and `count`'s cap `1..=MAX_COUNT_LIMIT` (`1000`); `count`
 runs `SELECT COUNT(*)` over a `LIMIT ?` subquery, so it stops at the cap rather
 than scanning the whole table.
+
+## Indexes and query planning
+
+Declare one or more indexes in a model's IR `indexes` array:
+
+```json
+{
+  "name": "Item",
+  "fields": [
+    {"name": "id", "type": "int", "primary": true},
+    {"name": "score", "type": "int"},
+    {"name": "kind", "type": "string"},
+    {"name": "slug", "type": "string"}
+  ],
+  "indexes": [
+    {"name": "by_score", "columns": ["score"]},
+    {"name": "by_kind_slug", "columns": ["kind", "slug"], "unique": true}
+  ]
+}
+```
+
+`name` and every column must match `[A-Za-z_][A-Za-z0-9_]*`; index names may
+not use SQLite's reserved `sqlite_` prefix. `columns` is non-empty, contains
+no repeated column and names only declared model fields. Duplicate index
+names or duplicate column lists are rejected, and index names must be unique
+across the whole generated schema. `unique` is an optional boolean defaulting
+to `false`; malformed declarations return a typed `DbError` whose
+`index_error_kind()` is one of `IndexErrorKind::EmptyColumns`,
+`UnknownColumn`, `DuplicateColumn`, `DuplicateIndex`, `InvalidIdentifier` or
+`InvalidDeclaration`. The builder equivalent is
+`model.index("by_score", &["score"], false)` or
+`model.index("by_kind_slug", &["kind", "slug"], true)`.
+
+`create_table_sql`, `schema_sql` and `migration_files` append one
+`CREATE INDEX IF NOT EXISTS` or `CREATE UNIQUE INDEX IF NOT EXISTS` statement
+per declaration after the table DDL. `Migration::from_model` returns one `up`
+body containing that table and all its indexes; `Migrator::apply` executes the
+body and its version insert in one transaction, so a failing migration rolls
+back both table and indexes. `IF NOT EXISTS` makes repeated schema application
+idempotent, and a unique multi-column index enforces duplicate rejection on
+insert. Index DDL requires a SQL driver that executes `CREATE INDEX`; `Kv` and
+`Memory` support only their documented SQL subset and do not materialize
+indexes.
+
+```rust
+let batch = [Migration::from_model(1, &model)?];
+let mut mig = Migrator::new(&mut db)?;
+mig.apply(&batch)?;
+```
+
+`Query::new(&model, &filters, table_rows)` copies a filter set and the model's
+declared indexes. `explain(&query) -> Plan` is pure: it opens no database and
+uses no driver statistics. Filter field names form a case-insensitive set;
+operators and values do not affect ranking. Each candidate index matches its
+leading columns only, stopping at the first missing one. The longest matching
+prefix wins; ties go to the lexicographically smallest index name. With no
+match the plan is `Scan::TableScan`; otherwise it is `Scan::IndexScan` with
+the chosen index name and `matched_columns`. `estimated_rows` is an integer:
+each matched column divides the supplied `table_rows` by ten with integer
+division (at least one row for a nonempty table), while a fully matched unique
+index estimates at most one row.
+
+```rust
+let plan = explain(&Query::new(&model, &filters, 10_000));
+assert_eq!(plan.scan, Scan::IndexScan);
+```
+
+SQLite's own `EXPLAIN QUERY PLAN`, read through `Sqlite::query` after inserting
+and analyzing rows, reports `SEARCH Indexed USING INDEX by_score (score=?)`
+for the indexed table and `SCAN Plain` for an equivalent unindexed table.
+`Sqlite::executed_statements()` counts statements rather than visited B-tree
+rows, so the tests bracket both measured EXPLAIN calls and both filtered
+queries with the counter and use SQLite's row-access report as the benefit
+evidence.
 
 ## Pooled SQLite handle
 
@@ -471,32 +551,33 @@ Output (deterministic, byte-identical when run twice):
 build/out/migrations/001_create_<model_lowercase>.sql
 build/out/migrations/002_create_<model_lowercase>.sql
 ...
-build/out/schema.sql          # all CREATE TABLE statements combined
+build/out/schema.sql          # all generated DDL combined
 ```
 
-Each file contains `CREATE TABLE IF NOT EXISTS ...;` so applying it twice is
-safe. Every written path is printed to stdout, one per line. `-o <out>` is
-the base directory; `-o <out>/migrations` is also accepted and normalizes to
-`<out>`. Field names, field types (`int|string|bool`), duplicate model names
-and duplicate primary keys are validated before anything is written. An
-empty `models` array produces no numbered migration files (only an empty
+Each file contains `CREATE TABLE IF NOT EXISTS ...;` followed by one
+`CREATE [UNIQUE] INDEX IF NOT EXISTS ...;` per declared index, so applying it
+twice is safe. Every written path is printed to stdout, one per line.
+`-o <out>` is the base directory; `-o <out>/migrations` is also accepted and
+normalizes to `<out>`. Field names, field types (`int|string|bool`), duplicate
+model names and duplicate primary keys are validated before anything is written.
+An empty `models` array produces no numbered migration files (only an empty
 `schema.sql`).
 
 The generated server needs no env var and no startup step from this crate.
-It can apply migrations with `db.exec(&schema_sql)` or call
+It can apply migrations with `db.exec(&schema_sql(&models)?)` or call
 `create_table(&mut db, &model)` per model at startup. The generated
 service opens one `PooledDb` at startup and runs migrations through `with`.
 
 ## Build and tests
 
 ```sh
-cargo fmt --all
 cargo test
+cargo fmt --check
 ```
 
-Thirty-four integration tests cover the core: SQLite CRUD round-trip against a
-temp file, deterministic pagination across repeated runs and insertion orders,
-native parameter binding with quotes, KV persistence across two
+Thirty-four tests in `tests/integration.rs` cover the core: SQLite CRUD
+round-trip against a temp file, deterministic pagination across repeated runs
+and insertion orders, native parameter binding with quotes, KV persistence across two
 opens, KV and Memory CRUD, migration SQL content and idempotency, malformed
 IR rejection, SQL injection on identifiers, empty-model migrations, the
 `opurom-migrate` binary, the `Row` / `Value` helpers, eight threads
@@ -520,6 +601,14 @@ loading (N posts and M authors loaded in exactly one counted statement with a
 complete ordered result keyed by foreign key, a dangling foreign key reported as
 a typed violation without a panic, an undeclared relation rejected, and a
 relation on a missing or non-int field rejected at validation).
+
+Eight tests in `tests/indexes.rs` cover generated single/multi-column and
+unique index DDL, idempotent creation, typed declaration validation, unique
+constraint enforcement through `Migrator`, transactional rollback of both the
+table and its indexes, pure planner prefix/tie/empty/invalid cases, and SQLite
+`EXPLAIN QUERY PLAN` evidence (`USING INDEX` versus `SCAN`) bracketed by
+`Sqlite::executed_statements()`. The existing migration, relation and filtered
+query tests remain green in the same run.
 
 Eight tests in `tests/pg_protocol.rs` cover a loopback mock server: startup
 and `Query` framing, `ParameterStatus` / `BackendKeyData` parsing, a two-row
@@ -558,9 +647,8 @@ SHA-256 known-answer vectors, the native-password scramble, the real MySQL 8.0
 fast-auth scramble, a deterministic RSA-OAEP ciphertext, and bounded statement
 framing.
 
-`cargo test --offline` runs 69 integration tests, 8 unit tests and 0 doc
-tests (77 total). `cargo fmt --all` and
-`RUSTFLAGS="-D warnings" cargo test --offline` pass with zero warnings. Sockets
+`cargo test` runs 77 integration tests, 8 unit tests and 0 doc tests
+(85 total). `cargo fmt --check` passes with zero formatting changes. Sockets
 bind to `127.0.0.1` on ephemeral ports and every server runs on background
 threads of the test process, so no external PostgreSQL or MySQL server is
 contacted and no server process is left running.
@@ -570,7 +658,10 @@ contacted and no server process is left running.
 Verified: SQLite via FFI on macOS/Linux, embedded file-backed KV, in-memory
 store, typed CRUD helpers, bounded filtered queries with deterministic
 multi-field ordering and capped counts on top of the same predicate,
-deterministic/idempotent migration SQL, identifier
+deterministic/idempotent migration SQL, declared single- and multi-column
+indexes with typed validation, unique enforcement and transactional DDL
+rollback, a pure deterministic prefix planner with integer estimates, SQLite
+`EXPLAIN QUERY PLAN` index-use evidence, identifier
 validation, parameter binding, `PRAGMA integrity_check` / `PRAGMA
 foreign_key_check` through the trait with typed reports, explicit transactions
 with a guard that rolls back on drop, a deterministic transactional migration
@@ -599,7 +690,7 @@ auth with a real RSA-OAEP/SHA-1 public-key exchange whose ciphertext is
 decrypted by the test private key. Bounded `COM_STMT_PREPARE` /
 `COM_STMT_EXECUTE` framing, ERR/truncated replies and a typed binary-result
 `UNSUPPORTED` path are verified too. No real MySQL server was tested.
-`cargo fmt --all` and `cargo test` pass with zero warnings.
+`cargo test` and `cargo fmt --check` pass.
 
 The bundled PostgreSQL server is a conformance harness for a small SQL subset,
 not a PostgreSQL replacement; no third-party PostgreSQL server was tested. The
