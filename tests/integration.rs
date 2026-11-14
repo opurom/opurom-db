@@ -442,6 +442,7 @@ fn list_paged_paginates_identically_across_runs() {
             primary: false,
             default: None,
         }],
+        relations: Vec::new(),
     };
     let err = list_paged(&mut db, &no_pk, 10, 0).unwrap_err();
     assert!(
@@ -1477,4 +1478,290 @@ fn query_binds_hostile_text_and_works_through_transaction_guard() {
         let dyn_db: &mut dyn Database = db;
         assert_eq!(count(dyn_db, model, &[], MAX_COUNT_LIMIT).unwrap(), 26);
     });
+}
+
+// ---- Schema migration runner ----
+
+fn mig_migrations() -> Vec<Migration> {
+    vec![
+        Migration::new(
+            1,
+            "CREATE TABLE author (id INTEGER PRIMARY KEY, name TEXT);",
+        ),
+        Migration::new(
+            2,
+            "CREATE TABLE post (id INTEGER PRIMARY KEY, author_id INTEGER, body TEXT);",
+        ),
+    ]
+}
+
+#[test]
+fn migrator_applies_in_order_and_is_idempotent() {
+    let dir = TempDir::new("mig-runner");
+    let path = dir.path().join("m.sqlite").to_str().unwrap().to_string();
+    let mut db = Sqlite::open(&path).unwrap();
+
+    let mut mig = Migrator::new(&mut db).unwrap();
+    assert_eq!(mig.applied().unwrap(), Vec::<i64>::new());
+    let applied = mig.apply(&mig_migrations()).unwrap();
+    assert_eq!(applied, vec![1, 2]);
+    assert_eq!(mig.applied().unwrap(), vec![1, 2]);
+    // Re-run applies nothing and is not an error.
+    assert_eq!(mig.apply(&mig_migrations()).unwrap(), Vec::<i64>::new());
+    assert_eq!(mig.applied().unwrap(), vec![1, 2]);
+
+    // The created tables exist once.
+    let tables = db
+        .query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")
+        .unwrap();
+    let names: Vec<String> = tables
+        .iter()
+        .filter_map(|r| r.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    assert_eq!(names, vec!["_migrations", "author", "post"]);
+}
+
+#[test]
+fn migrator_rolls_back_a_failing_migration_without_a_record() {
+    let dir = TempDir::new("mig-fail");
+    let path = dir.path().join("m.sqlite").to_str().unwrap().to_string();
+    let mut db = Sqlite::open(&path).unwrap();
+
+    let batch = vec![
+        Migration::new(1, "CREATE TABLE ok (id INTEGER PRIMARY KEY);"),
+        Migration::new(2, "CREATE TABLE broken (id INTEGER PRIMARY KEY;"), // syntax error
+    ];
+    let mut mig = Migrator::new(&mut db).unwrap();
+    let err = mig.apply(&batch).unwrap_err();
+    assert!(matches!(err, MigrationError::Failed { version: 2, .. }));
+    assert!(err.message().contains("rolled back"));
+
+    // Version 1 committed; version 2 rolled back and is not recorded.
+    assert_eq!(mig.applied().unwrap(), vec![1]);
+    let broken = db
+        .query("SELECT name FROM sqlite_master WHERE type='table' AND name='broken';")
+        .unwrap();
+    assert!(
+        broken.is_empty(),
+        "the failed migration must not create its table"
+    );
+}
+
+#[test]
+fn migrator_rejects_out_of_order_missing_and_duplicate_versions() {
+    let dir = TempDir::new("mig-order");
+    let path = dir.path().join("m.sqlite").to_str().unwrap().to_string();
+    let mut db = Sqlite::open(&path).unwrap();
+    let mut mig = Migrator::new(&mut db).unwrap();
+
+    // A gap: version 2 without 1.
+    let gap = vec![
+        Migration::new(1, "CREATE TABLE a (id INTEGER PRIMARY KEY);"),
+        Migration::new(3, "CREATE TABLE c (id INTEGER PRIMARY KEY);"),
+    ];
+    let err = mig.apply(&gap).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            MigrationError::MissingVersion {
+                expected: 2,
+                found: 3
+            }
+        ),
+        "unexpected: {err}"
+    );
+
+    // Duplicate versions.
+    let dup = vec![
+        Migration::new(1, "CREATE TABLE a (id INTEGER PRIMARY KEY);"),
+        Migration::new(1, "CREATE TABLE b (id INTEGER PRIMARY KEY);"),
+    ];
+    assert!(matches!(
+        mig.apply(&dup).unwrap_err(),
+        MigrationError::DuplicateVersion { version: 1 }
+    ));
+
+    // Applied-ahead: the database already holds 2, an older batch stops at 1.
+    assert_eq!(mig.apply(&mig_migrations()).unwrap(), vec![1, 2]);
+    let older = vec![Migration::new(
+        1,
+        "CREATE TABLE a (id INTEGER PRIMARY KEY);",
+    )];
+    assert!(matches!(
+        mig.apply(&older).unwrap_err(),
+        MigrationError::AppliedAhead {
+            recorded: 2,
+            found: 1
+        }
+    ));
+    // Nothing was disturbed.
+    assert_eq!(mig.applied().unwrap(), vec![1, 2]);
+}
+
+// ---- Eager relation loading ----
+
+fn author_model() -> Model {
+    parse_models(
+        r#"{"ir":"0.1","models":[{"name":"Author","fields":[
+          {"name":"id","type":"int","primary":true},
+          {"name":"name","type":"string"}
+        ]}]}"#,
+    )
+    .unwrap()
+    .pop()
+    .unwrap()
+}
+
+fn post_model() -> Model {
+    parse_models(
+        r#"{"ir":"0.1","models":[{"name":"Post","fields":[
+          {"name":"id","type":"int","primary":true},
+          {"name":"author_id","type":"int"},
+          {"name":"body","type":"string"}
+        ],"relations":[{"field":"author_id","parent":"Author"}]}]}"#,
+    )
+    .unwrap()
+    .pop()
+    .unwrap()
+}
+
+#[test]
+fn with_related_fetches_all_children_in_one_statement() {
+    let dir = TempDir::new("eager");
+    let path = dir.path().join("e.sqlite").to_str().unwrap().to_string();
+    let mut db = Sqlite::open(&path).unwrap();
+    let authors = author_model();
+    let posts = post_model();
+    create_table(&mut db, &authors).unwrap();
+    create_table(&mut db, &posts).unwrap();
+
+    // M = 3 authors; N = 9 posts spread across them (4, 3, 2). No author 4.
+    for id in 1..=3 {
+        create(
+            &mut db,
+            &authors,
+            &[
+                ("id", Value::Int(id)),
+                ("name", Value::Text(format!("author {id}"))),
+            ],
+        )
+        .unwrap();
+    }
+    let counts = [(1, 4), (2, 3), (3, 2)];
+    let mut pid = 1;
+    for (author_id, n) in counts {
+        for _ in 0..n {
+            create(
+                &mut db,
+                &posts,
+                &[
+                    ("id", Value::Int(pid)),
+                    ("author_id", Value::Int(author_id)),
+                    ("body", Value::Text(format!("post {pid}"))),
+                ],
+            )
+            .unwrap();
+            pid += 1;
+        }
+    }
+
+    // The FK holders are the N=9 posts; eager load their related Authors.
+    let parents = list(&mut db, &posts).unwrap();
+    assert_eq!(parents.len(), 9);
+
+    let before = db.executed_statements();
+    let (groups, violations) = with_related(&mut db, &posts, &parents, "author_id").unwrap();
+    let executed = db.executed_statements() - before;
+
+    // ONE additional statement, independent of the N posts and M authors.
+    assert_eq!(executed, 1, "eager load must be exactly one statement");
+    assert!(violations.is_empty());
+
+    // Keyed by the foreign-key value, one entry per distinct author_id.
+    assert_eq!(groups.len(), 3);
+    // Each entry holds exactly one complete related row, deterministic.
+    assert_eq!(
+        groups[&1][0].get("name"),
+        Some(&Value::Text("author 1".into()))
+    );
+    assert_eq!(
+        groups[&2][0].get("name"),
+        Some(&Value::Text("author 2".into()))
+    );
+    assert_eq!(
+        groups[&3][0].get("name"),
+        Some(&Value::Text("author 3".into()))
+    );
+}
+
+#[test]
+fn with_related_reports_a_dangling_foreign_key() {
+    let dir = TempDir::new("eager-dangling");
+    let path = dir.path().join("e.sqlite").to_str().unwrap().to_string();
+    let mut db = Sqlite::open(&path).unwrap();
+    let authors = author_model();
+    let posts = post_model();
+    create_table(&mut db, &authors).unwrap();
+    create_table(&mut db, &posts).unwrap();
+
+    create(
+        &mut db,
+        &authors,
+        &[("id", Value::Int(1)), ("name", Value::Text("real".into()))],
+    )
+    .unwrap();
+    // author_id 99 has no matching Author row (SQLite FK enforcement is off).
+    create(
+        &mut db,
+        &posts,
+        &[
+            ("id", Value::Int(1)),
+            ("author_id", Value::Int(99)),
+            ("body", Value::Text("orphan".into())),
+        ],
+    )
+    .unwrap();
+
+    let parents = list(&mut db, &posts).unwrap();
+    let (groups, violations) = with_related(&mut db, &posts, &parents, "author_id").unwrap();
+    assert_eq!(groups.get(&99).map(Vec::len), Some(0));
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0].parent, "Author");
+    assert_eq!(violations[0].table, "Post");
+    assert_eq!(violations[0].rowid, Some(99));
+}
+
+#[test]
+fn with_related_rejects_an_undeclared_relation() {
+    let dir = TempDir::new("eager-bad");
+    let path = dir.path().join("e.sqlite").to_str().unwrap().to_string();
+    let mut db = Sqlite::open(&path).unwrap();
+    let posts = post_model();
+    create_table(&mut db, &posts).unwrap();
+    let err = with_related(&mut db, &posts, &[], "nope").unwrap_err();
+    assert!(err.message().contains("no relation on field"));
+}
+
+#[test]
+fn relation_on_missing_or_non_int_field_is_rejected() {
+    let mut m = post_model();
+    m.relations.push(Relation {
+        field: "missing".into(),
+        parent: "Author".into(),
+    });
+    assert!(validate_model(&m).is_err());
+
+    let mut m2 = post_model();
+    m2.name = "Bad".into();
+    m2.fields.push(Field {
+        name: "slug".into(),
+        ty: FieldType::Text,
+        primary: false,
+        default: None,
+    });
+    m2.relations.push(Relation {
+        field: "slug".into(),
+        parent: "Author".into(),
+    });
+    assert!(validate_model(&m2).is_err());
 }

@@ -70,6 +70,14 @@ pub trait Database {
 | `DbError::query_error_kind()` | typed query error category: unknown field/operator, unsupported operator, type mismatch, invalid sort direction, out of range |
 | `Database::integrity_check()` | default method running `PRAGMA integrity_check` through `query`; returns `IntegrityReport` with `is_ok()` and `problems()` |
 | `Database::foreign_key_check()` | default method running `PRAGMA foreign_key_check` through `query`; returns `Vec<ForeignKeyViolation>` with `table`, `rowid`, `parent` and `foreign_key`, empty when nothing is wrong |
+| `Migration { version, up }` | one numbered migration: integer `version` plus `up` SQL |
+| `Migrator::new(&mut db)` | creates `_migrations` if missing and returns a runner |
+| `Migrator::apply(&[Migration])` | applies pending versions in order, one transaction each; returns the newly applied versions |
+| `Migrator::applied()` | ascending versions already recorded in `_migrations` |
+| `MigrationError` | typed: `MissingVersion`, `DuplicateVersion`, `AppliedAhead`, `Failed` |
+| `Model::relation(field, parent)` | declares a `field -> parent.id` foreign-key relation |
+| `with_related(db, model, parents, field)` | eager loads all related rows in ONE query; `BTreeMap<i64, Vec<Row>>` plus dangling-FK `Vec<ForeignKeyViolation>` |
+| `Sqlite::executed_statements()` | monotonic count of statements run through the handle, for query-count tests |
 | `Transaction::commit()` / `rollback()` | explicit `COMMIT` / `ROLLBACK`; both release the driver borrow |
 
 `Row::insert(name, value)` works both in place (`let mut r = Row::new();
@@ -394,6 +402,63 @@ preserves `int` / `string` / `bool` across reopens.
 Same SQL subset and semantics as `Kv`, with no file. Useful for tests and
 generated code.
 
+## Schema migration runner
+
+```rust
+let batch = [
+    Migration::new(1, "CREATE TABLE author (id INTEGER PRIMARY KEY, name TEXT);"),
+    Migration::new(2, "CREATE TABLE post (id INTEGER PRIMARY KEY, author_id INTEGER, body TEXT);"),
+];
+let mut mig = Migrator::new(&mut db)?;      // CREATE TABLE IF NOT EXISTS _migrations
+let applied = mig.apply(&batch)?;           // vec![1, 2] on a fresh database
+assert_eq!(mig.apply(&batch)?, vec![]);     // idempotent: nothing to do
+assert_eq!(mig.applied()?, vec![1, 2]);     // recorded versions, ascending
+```
+
+`Migrator` records every applied version in the `_migrations` table
+(`version INTEGER PRIMARY KEY`, `applied_at TEXT`). `apply` sorts the batch,
+requires versions to start at `1` and increase by exactly one, and applies each
+not-yet-recorded version inside its own transaction together with its
+`_migrations` insert. A migration whose SQL fails rolls back and records
+nothing, so the versions before it stay committed and the failed one is retried
+on the next run (`MigrationError::Failed`). Applying an already-applied version
+is a no-op (`apply` returns only the newly applied versions), never an error. A
+gap returns `MigrationError::MissingVersion` (`{ expected, found }`), a repeated
+version `MigrationError::DuplicateVersion`, and a batch older than the database
+`MigrationError::AppliedAhead` (`{ recorded, found }`); none of these touch the
+database.
+
+## Eager relation loading
+
+```rust
+let posts = parse_models(r#"{"ir":"0.1","models":[{"name":"Post","fields":[
+  {"name":"id","type":"int","primary":true},
+  {"name":"author_id","type":"int"},
+  {"name":"body","type":"string"}
+],"relations":[{"field":"author_id","parent":"Author"}]}]}"#)?;
+let posts = posts.pop().unwrap();
+
+let parents = list(&mut db, &posts)?;                       // the FK-holding rows
+let (by_author, dangling) =
+    with_related(&mut db, &posts, &parents, "author_id")?;  // ONE extra query
+let authors_of_author_1 = by_author.get(&1).cloned().unwrap_or_default();
+```
+
+A relation is declared on a model as `"relations": [{ "field": "author_id",
+"parent": "Author" }]` or with `Model::relation("author_id", "Author")`. The
+field must exist and be `int` (a foreign key to the parent primary key). Values
+are validated identifiers, so a relation is safe to format into SQL.
+
+`with_related` collects the distinct non-null foreign-key values across all
+`parents` and issues a single `SELECT * FROM <parent> WHERE id IN (?, ?, ...)`,
+so the query count is constant no matter how many parent or related rows there
+are — proven in the tests by counting `Sqlite::executed_statements()`. It
+returns a `BTreeMap<i64, Vec<Row>>` keyed by the foreign-key value; every parent
+value present gets an entry, empty when no related row matches (never a panic),
+and each related row is a complete normalized `Row`, ordered by `id`. A parent
+whose foreign key matches no parent-table row is a dangling key, reported as a
+`ForeignKeyViolation` (`table`, `rowid`, `parent`) instead of being dropped.
+
 ## Migrations
 
 ```sh
@@ -429,7 +494,7 @@ cargo fmt --all
 cargo test
 ```
 
-Twenty-seven integration tests cover the core: SQLite CRUD round-trip against a
+Thirty-four integration tests cover the core: SQLite CRUD round-trip against a
 temp file, deterministic pagination across repeated runs and insertion orders,
 native parameter binding with quotes, KV persistence across two
 opens, KV and Memory CRUD, migration SQL content and idempotency, malformed
@@ -447,7 +512,14 @@ sorting with repeated-run byte identity and insertion-order independence,
 filtered and bounded counts matching page sizes, and typed rejection of unknown
 fields, unknown or range operators and out-of-range values without panicking;
 one also binds hostile text through the query layer inside the existing
-transaction guard.
+transaction guard. Seven more cover the new data layer: the migration runner
+(apply in order, an idempotent re-run that applies nothing, a failing migration
+that rolls back and records nothing while earlier versions stay committed, and
+typed rejection of gap, duplicate and applied-ahead batches), and eager relation
+loading (N posts and M authors loaded in exactly one counted statement with a
+complete ordered result keyed by foreign key, a dangling foreign key reported as
+a typed violation without a panic, an undeclared relation rejected, and a
+relation on a missing or non-int field rejected at validation).
 
 Eight tests in `tests/pg_protocol.rs` cover a loopback mock server: startup
 and `Query` framing, `ParameterStatus` / `BackendKeyData` parsing, a two-row
@@ -486,8 +558,8 @@ SHA-256 known-answer vectors, the native-password scramble, the real MySQL 8.0
 fast-auth scramble, a deterministic RSA-OAEP ciphertext, and bounded statement
 framing.
 
-`cargo test --offline` runs 61 integration tests, 8 unit tests and 0 doc
-tests (69 total). `cargo fmt --all` and
+`cargo test --offline` runs 69 integration tests, 8 unit tests and 0 doc
+tests (77 total). `cargo fmt --all` and
 `RUSTFLAGS="-D warnings" cargo test --offline` pass with zero warnings. Sockets
 bind to `127.0.0.1` on ephemeral ports and every server runs on background
 threads of the test process, so no external PostgreSQL or MySQL server is
@@ -501,8 +573,12 @@ multi-field ordering and capped counts on top of the same predicate,
 deterministic/idempotent migration SQL, identifier
 validation, parameter binding, `PRAGMA integrity_check` / `PRAGMA
 foreign_key_check` through the trait with typed reports, explicit transactions
-with a guard that rolls back on drop, a Mutex-serialized shared SQLite handle
-with a threaded CRUD test, `opurom-db` library and `opurom-migrate` binary. Also
+with a guard that rolls back on drop, a deterministic transactional migration
+runner with an idempotent re-run and typed out-of-order/missing/duplicate
+rejection, one-query eager relation loading with a counted-statement no-N+1
+proof and dangling-foreign-key reporting, a Mutex-serialized shared SQLite
+handle with a threaded CRUD test, `opurom-db` library and `opurom-migrate`
+binary. Also
 verified against a local TCP mock: PostgreSQL v3 startup and simple-query
 framing, typed text rows, readable errors, unsupported-auth rejection,
 size/time bounds, and `Database` trait routing. The bundled

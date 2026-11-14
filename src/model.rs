@@ -45,10 +45,24 @@ pub struct Field {
     pub default: Option<Value>,
 }
 
+/// A declared foreign-key relation: the model field `field` holds the primary
+/// key `parent` of another model. Values are validated identifiers, so a
+/// relation can be turned into SQL without quoting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Relation {
+    /// This model's foreign-key field, e.g. `author_id`.
+    pub field: String,
+    /// The related model name, e.g. `User`.
+    pub parent: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Model {
     pub name: String,
     pub fields: Vec<Field>,
+    /// Foreign-key relations declared on this model. Empty by default; use
+    /// `relation` to declare one, and [`crate::with_related`] to eager load.
+    pub relations: Vec<Relation>,
 }
 
 impl Model {
@@ -114,9 +128,32 @@ impl Model {
                 default,
             });
         }
+        let mut relations = Vec::new();
+        if let Some(entries) = obj.get("relations").and_then(Json::as_array) {
+            for entry in entries {
+                let robj = entry.as_object().ok_or_else(|| {
+                    DbError::new(format!("relation of model {name:?} must be a JSON object"))
+                })?;
+                let field = robj.get("field").and_then(Json::as_str).ok_or_else(|| {
+                    DbError::new(format!(
+                        "relation of model {name:?} is missing a string 'field'"
+                    ))
+                })?;
+                let parent = robj.get("parent").and_then(Json::as_str).ok_or_else(|| {
+                    DbError::new(format!(
+                        "relation of model {name:?} is missing a string 'parent'"
+                    ))
+                })?;
+                relations.push(Relation {
+                    field: field.to_string(),
+                    parent: parent.to_string(),
+                });
+            }
+        }
         let model = Model {
             name: name.to_string(),
             fields,
+            relations,
         };
         validate_model(&model)?;
         Ok(model)
@@ -177,7 +214,46 @@ pub fn validate_model(model: &Model) -> Result<(), DbError> {
             model.name
         )));
     }
+    let mut rel_fields = BTreeSet::new();
+    for r in &model.relations {
+        validate_ident(&r.field)?;
+        validate_ident(&r.parent)?;
+        let field = model.fields.iter().find(|f| f.name == r.field);
+        match field {
+            None => {
+                return Err(DbError::new(format!(
+                    "relation on model {:?} names field {:?}, which the model does not declare",
+                    model.name, r.field
+                )))
+            }
+            Some(f) if f.ty != FieldType::Int => {
+                return Err(DbError::new(format!(
+                    "relation field {:?} of model {:?} must be int to hold a foreign key",
+                    r.field, model.name
+                )))
+            }
+            Some(_) => {}
+        }
+        if !rel_fields.insert(r.field.as_str()) {
+            return Err(DbError::new(format!(
+                "model {:?} declares more than one relation on field {:?}",
+                model.name, r.field
+            )));
+        }
+    }
     Ok(())
+}
+
+impl Model {
+    /// Declare a foreign-key relation on `field` pointing at `parent`'s
+    /// primary key and return the model for chaining.
+    pub fn relation(mut self, field: &str, parent: &str) -> Model {
+        self.relations.push(Relation {
+            field: field.to_string(),
+            parent: parent.to_string(),
+        });
+        self
+    }
 }
 
 fn default_matches(ty: FieldType, value: &Value) -> bool {
