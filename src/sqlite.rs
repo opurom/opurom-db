@@ -298,17 +298,28 @@ impl Conn {
 
 pub struct Sqlite {
     conn: Conn,
+    statements: u64,
 }
 
 impl Sqlite {
     pub fn open(path: &str) -> Result<Sqlite, DbError> {
         Ok(Sqlite {
             conn: Conn::open(path)?,
+            statements: 0,
         })
+    }
+
+    /// Count of SQL statements executed through this handle so far: every
+    /// `exec`, `query`, `exec_params` and `query_params` call adds one. It
+    /// never resets and only increments, so a test can bracket a call with
+    /// two readings to prove a query count.
+    pub fn executed_statements(&self) -> u64 {
+        self.statements
     }
 
     /// Execute `sql` with real `sqlite3_bind_*` parameter binding.
     pub fn exec_params(&mut self, sql: &str, params: &[Value]) -> Result<(), DbError> {
+        self.statements += 1;
         let (stmt, owned) = self.conn.prepare(sql, params)?;
         let result = self.conn.run(&stmt);
         drop(stmt);
@@ -318,6 +329,7 @@ impl Sqlite {
 
     /// Query with real `sqlite3_bind_*` parameter binding.
     pub fn query_params(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
+        self.statements += 1;
         let (stmt, owned) = self.conn.prepare(sql, params)?;
         let result = self.conn.rows(&stmt);
         drop(stmt);
@@ -328,10 +340,12 @@ impl Sqlite {
 
 impl Database for Sqlite {
     fn exec(&mut self, sql: &str) -> Result<(), DbError> {
+        self.statements += 1;
         self.conn.exec(sql)
     }
 
     fn query(&mut self, sql: &str) -> Result<Vec<Row>, DbError> {
+        self.statements += 1;
         let (stmt, owned) = self.conn.prepare(sql, &[])?;
         let result = self.conn.rows(&stmt);
         drop(stmt);

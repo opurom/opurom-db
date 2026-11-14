@@ -6,11 +6,14 @@
 //! text-query frontend), [`Kv`] (file-backed key/value store) and [`Memory`]
 //! (volatile). [`PooledDb`] shares one Mutex-serialized `Sqlite` connection
 //! between threads. IR model definitions drive type-correct CRUD SQL and
-//! deterministic migration files and a bounded filtered query layer.
+//! deterministic migration files, a bounded filtered query layer, a
+//! transactional [`Migrator`] that records applied versions in `_migrations`,
+//! and one-query eager loading of declared foreign-key relations.
 
 mod crud;
 mod kv;
 mod memory;
+mod migrations;
 mod model;
 mod mysql;
 mod mysql_crypto;
@@ -18,6 +21,7 @@ mod pg;
 mod pgserver;
 mod pool;
 mod queries;
+mod relations;
 mod store;
 mod transaction;
 
@@ -33,15 +37,17 @@ mod sqlite;
 pub use crud::{create, create_table, delete, get, list, list_paged, update, MAX_PAGE_LIMIT};
 pub use kv::Kv;
 pub use memory::Memory;
+pub use migrations::{Migration, MigrationError, Migrator};
 pub use model::{
     create_table_sql, migration_files, parse_models, parse_models_value, schema_sql, sql_literal,
-    validate_ident, validate_model, write_migrations, Field, FieldType, Model,
+    validate_ident, validate_model, write_migrations, Field, FieldType, Model, Relation,
 };
 pub use mysql::{MySqlConnection, MySqlStatement};
 pub use pg::{PgConnection, PgNotification};
 pub use pgserver::{PgAuth, PgServer, PgServerOptions, PgTls};
 pub use pool::PooledDb;
 pub use queries::{count, query, Filter, Sort, MAX_COUNT_LIMIT};
+pub use relations::with_related;
 pub use sqlite::Sqlite;
 pub use transaction::Transaction;
 
