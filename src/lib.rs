@@ -6,7 +6,7 @@
 //! text-query frontend), [`Kv`] (file-backed key/value store) and [`Memory`]
 //! (volatile). [`PooledDb`] shares one Mutex-serialized `Sqlite` connection
 //! between threads. IR model definitions drive type-correct CRUD SQL and
-//! deterministic migration files.
+//! deterministic migration files and a bounded filtered query layer.
 
 mod crud;
 mod kv;
@@ -17,6 +17,7 @@ mod mysql_crypto;
 mod pg;
 mod pgserver;
 mod pool;
+mod queries;
 mod store;
 mod transaction;
 
@@ -40,6 +41,7 @@ pub use mysql::{MySqlConnection, MySqlStatement};
 pub use pg::{PgConnection, PgNotification};
 pub use pgserver::{PgAuth, PgServer, PgServerOptions, PgTls};
 pub use pool::PooledDb;
+pub use queries::{count, query, Filter, Sort, MAX_COUNT_LIMIT};
 pub use sqlite::Sqlite;
 pub use transaction::Transaction;
 
@@ -73,6 +75,30 @@ impl MySqlErrorKind {
             MySqlErrorKind::DuplicateEntry => "duplicate entry",
             MySqlErrorKind::AccessDenied => "access denied",
             MySqlErrorKind::Other => "server error",
+        }
+    }
+}
+
+/// The typed category of a query-layer validation failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryErrorKind {
+    UnknownField,
+    UnknownOperator,
+    UnsupportedOperator,
+    TypeMismatch,
+    InvalidSortDirection,
+    OutOfRange,
+}
+
+impl QueryErrorKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            QueryErrorKind::UnknownField => "unknown query field",
+            QueryErrorKind::UnknownOperator => "unknown query operator",
+            QueryErrorKind::UnsupportedOperator => "unsupported query operator",
+            QueryErrorKind::TypeMismatch => "query value type mismatch",
+            QueryErrorKind::InvalidSortDirection => "invalid query sort direction",
+            QueryErrorKind::OutOfRange => "out-of-range query value",
         }
     }
 }
@@ -199,13 +225,15 @@ impl Row {
 }
 
 /// A readable, non-panicking error carrying the underlying driver message,
-/// an optional SQLSTATE and an optional MySQL error code.
+/// an optional SQLSTATE, an optional MySQL error code and an optional typed
+/// query validation category.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DbError {
     message: String,
     sqlstate: Option<String>,
     mysql_code: Option<u16>,
     mysql_kind: Option<MySqlErrorKind>,
+    query_kind: Option<QueryErrorKind>,
 }
 
 impl DbError {
@@ -215,6 +243,7 @@ impl DbError {
             sqlstate: None,
             mysql_code: None,
             mysql_kind: None,
+            query_kind: None,
         }
     }
 
@@ -225,6 +254,7 @@ impl DbError {
             sqlstate: Some(sqlstate.into()),
             mysql_code: None,
             mysql_kind: None,
+            query_kind: None,
         }
     }
 
@@ -235,6 +265,17 @@ impl DbError {
             sqlstate: sqlstate.map(str::to_string),
             mysql_code: Some(code),
             mysql_kind: Some(MySqlErrorKind::from_code(code)),
+            query_kind: None,
+        }
+    }
+
+    pub(crate) fn with_query_error(kind: QueryErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            message: format!("{}: {}", kind.label(), message.into()),
+            sqlstate: None,
+            mysql_code: None,
+            mysql_kind: None,
+            query_kind: Some(kind),
         }
     }
 
@@ -255,6 +296,11 @@ impl DbError {
     /// The typed category of a MySQL server error code.
     pub fn mysql_error_kind(&self) -> Option<MySqlErrorKind> {
         self.mysql_kind
+    }
+
+    /// The typed category of a query-layer validation failure.
+    pub fn query_error_kind(&self) -> Option<QueryErrorKind> {
+        self.query_kind
     }
 }
 

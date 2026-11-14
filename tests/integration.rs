@@ -1016,3 +1016,465 @@ fn pragma_checks_answer_readably_without_sqlite_semantics() {
         .expect_err("Memory has no SQLite pragmas");
     assert!(!foreign_keys.message().is_empty());
 }
+
+#[derive(Clone)]
+struct QueryItem {
+    id: i64,
+    score: i64,
+    label: String,
+    active: bool,
+}
+
+fn query_model() -> Model {
+    parse_models(
+        r#"{"ir":"0.1","models":[{"name":"Item","fields":[
+          {"name":"id","type":"int","primary":true},
+          {"name":"score","type":"int"},
+          {"name":"label","type":"string"},
+          {"name":"active","type":"bool"}
+        ]}]}"#,
+    )
+    .unwrap()
+    .pop()
+    .unwrap()
+}
+
+fn query_items() -> Vec<QueryItem> {
+    let labels = ["alpha", "beta", "gamma"];
+    (1..=25)
+        .map(|id| QueryItem {
+            id,
+            score: ((id - 1) % 5) * 10,
+            label: labels[(id - 1) as usize % labels.len()].to_string(),
+            active: id % 2 == 0,
+        })
+        .collect()
+}
+
+fn with_query_db<T>(tag: &str, reverse: bool, f: impl FnOnce(&mut Sqlite, &Model) -> T) -> T {
+    let dir = TempDir::new(tag);
+    let db_path = dir.path().join("items.sqlite");
+    let mut db = Sqlite::open(db_path.to_str().unwrap()).unwrap();
+    let model = query_model();
+    create_table(&mut db, &model).unwrap();
+    let mut items = query_items();
+    if reverse {
+        items.reverse();
+    }
+    for item in &items {
+        create(
+            &mut db,
+            &model,
+            &[
+                ("id", Value::Int(item.id)),
+                ("score", Value::Int(item.score)),
+                ("label", Value::Text(item.label.clone())),
+                ("active", Value::Bool(item.active)),
+            ],
+        )
+        .unwrap();
+    }
+    f(&mut db, &model)
+}
+
+fn int_filter<'a>(field: &'a str, op: &'a str, value: i64) -> Filter<'a> {
+    Filter {
+        field,
+        op,
+        value: Value::Int(value),
+    }
+}
+
+fn text_filter<'a>(field: &'a str, op: &'a str, value: &str) -> Filter<'a> {
+    Filter {
+        field,
+        op,
+        value: Value::Text(value.to_string()),
+    }
+}
+
+fn bool_filter<'a>(field: &'a str, op: &'a str, value: bool) -> Filter<'a> {
+    Filter {
+        field,
+        op,
+        value: Value::Bool(value),
+    }
+}
+
+fn sort_term<'a>(field: &'a str, direction: &'a str) -> Sort<'a> {
+    Sort { field, direction }
+}
+
+fn query_ids(rows: &[Row]) -> Vec<i64> {
+    rows.iter()
+        .map(|row| row.get("id").unwrap().as_i64().unwrap())
+        .collect()
+}
+
+/// Length-prefixed cells make repeated result comparison an exact byte check.
+fn row_bytes(rows: &[Row]) -> Vec<u8> {
+    fn put_len(bytes: &mut Vec<u8>, len: usize) {
+        bytes.extend_from_slice(&(len as u64).to_le_bytes());
+    }
+    let mut bytes = Vec::new();
+    for row in rows {
+        for (name, value) in row.columns() {
+            put_len(&mut bytes, name.len());
+            bytes.extend_from_slice(name.as_bytes());
+            match value {
+                Value::Int(n) => {
+                    bytes.push(0);
+                    bytes.extend_from_slice(&n.to_le_bytes());
+                }
+                Value::Text(s) => {
+                    bytes.push(1);
+                    put_len(&mut bytes, s.len());
+                    bytes.extend_from_slice(s.as_bytes());
+                }
+                Value::Bool(b) => {
+                    bytes.push(2);
+                    bytes.push(if *b { 1 } else { 0 });
+                }
+            }
+        }
+        bytes.push(0xff);
+    }
+    bytes
+}
+
+fn expected_ids(items: &[QueryItem], sorts: &[Sort<'_>]) -> Vec<i64> {
+    let mut ids: Vec<i64> = items.iter().map(|item| item.id).collect();
+    if !sorts.iter().any(|s| s.field == "id") {
+        ids.sort_unstable();
+    }
+    // Stable sorts from the least significant key reproduce SQL's ORDER BY.
+    for s in sorts.iter().rev() {
+        let desc = s.direction.eq_ignore_ascii_case("desc");
+        ids.sort_by(|a, b| {
+            let x = items.iter().find(|item| item.id == *a).unwrap();
+            let y = items.iter().find(|item| item.id == *b).unwrap();
+            let ordering = match s.field {
+                "id" => a.cmp(b),
+                "score" => x.score.cmp(&y.score),
+                "label" => x.label.cmp(&y.label),
+                "active" => x.active.cmp(&y.active),
+                other => panic!("unexpected sort field {other}"),
+            };
+            if desc {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+    }
+    ids
+}
+
+fn no_panic<T>(f: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .unwrap_or_else(|_| panic!("query validation panicked"))
+}
+
+fn assert_typed<T>(result: Result<T, DbError>, kind: QueryErrorKind, mention: &str) {
+    match result {
+        Ok(_) => panic!("expected {kind:?} error mentioning {mention:?}"),
+        Err(err) => {
+            assert_eq!(err.query_error_kind(), Some(kind), "{err}");
+            assert!(err.message().contains(mention), "{err}");
+        }
+    }
+}
+
+#[test]
+fn filtered_query_covers_every_operator_on_25_rows() {
+    let cases: Vec<(Filter<'static>, Vec<i64>)> = vec![
+        (int_filter("score", "=", 20), vec![3, 8, 13, 18, 23]),
+        (
+            int_filter("score", "!=", 20),
+            vec![
+                1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15, 16, 17, 19, 20, 21, 22, 24, 25,
+            ],
+        ),
+        (
+            int_filter("score", "<", 20),
+            vec![1, 2, 6, 7, 11, 12, 16, 17, 21, 22],
+        ),
+        (
+            int_filter("score", "<=", 20),
+            vec![1, 2, 3, 6, 7, 8, 11, 12, 13, 16, 17, 18, 21, 22, 23],
+        ),
+        (
+            int_filter("score", ">", 20),
+            vec![4, 5, 9, 10, 14, 15, 19, 20, 24, 25],
+        ),
+        (
+            int_filter("score", ">=", 20),
+            vec![3, 4, 5, 8, 9, 10, 13, 14, 15, 18, 19, 20, 23, 24, 25],
+        ),
+        (
+            text_filter("label", "=", "alpha"),
+            vec![1, 4, 7, 10, 13, 16, 19, 22, 25],
+        ),
+        (
+            text_filter("label", "!=", "alpha"),
+            vec![2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 23, 24],
+        ),
+        (
+            bool_filter("active", "=", true),
+            vec![2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24],
+        ),
+        (
+            bool_filter("active", "!=", false),
+            vec![2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24],
+        ),
+        (
+            bool_filter("active", "=", false),
+            vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25],
+        ),
+        (
+            bool_filter("active", "!=", true),
+            vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25],
+        ),
+    ];
+    assert_eq!(query_items().len(), 25);
+    with_query_db("query-operators", false, |db, model| {
+        for (filter, expected) in cases {
+            let filters = [filter];
+            let field = filters[0].field;
+            let op = filters[0].op;
+            let rows = query(db, model, &filters, &[], MAX_PAGE_LIMIT, 0).unwrap();
+            assert_eq!(query_ids(&rows), expected, "{field} {op}");
+            assert_eq!(
+                count(db, model, &filters, MAX_COUNT_LIMIT).unwrap(),
+                expected.len() as i64,
+                "{field} {op} count"
+            );
+        }
+    });
+}
+
+#[test]
+fn multi_field_sort_is_deterministic_and_count_matches_page() {
+    let matching: Vec<QueryItem> = query_items()
+        .into_iter()
+        .filter(|item| item.score >= 10 && item.label != "gamma" && item.active)
+        .collect();
+    let filters = [
+        int_filter("score", ">=", 10),
+        text_filter("label", "!=", "gamma"),
+        bool_filter("active", "=", true),
+    ];
+    let mut reference_bytes = Vec::new();
+    with_query_db("query-sort", false, |db, model| {
+        assert_eq!(count(db, model, &[], MAX_COUNT_LIMIT).unwrap(), 25);
+        for field in ["score", "label", "active", "id"] {
+            for direction in ["asc", "desc"] {
+                let sorts = [sort_term(field, direction)];
+                let rows = query(db, model, &filters, &sorts, MAX_PAGE_LIMIT, 0).unwrap();
+                assert_eq!(
+                    query_ids(&rows),
+                    expected_ids(&matching, &sorts),
+                    "{field} {direction}"
+                );
+            }
+        }
+        for score_dir in ["asc", "desc"] {
+            for label_dir in ["asc", "desc"] {
+                let sorts = [sort_term("score", score_dir), sort_term("label", label_dir)];
+                let rows = query(db, model, &filters, &sorts, MAX_PAGE_LIMIT, 0).unwrap();
+                assert_eq!(
+                    query_ids(&rows),
+                    expected_ids(&matching, &sorts),
+                    "score {score_dir}, label {label_dir}"
+                );
+                assert_eq!(
+                    count(db, model, &filters, MAX_COUNT_LIMIT).unwrap(),
+                    rows.len() as i64,
+                    "filtered count equals full page count"
+                );
+                let short_page = query(db, model, &filters, &sorts, 3, 0).unwrap();
+                assert_eq!(
+                    count(db, model, &filters, 3).unwrap(),
+                    short_page.len() as i64,
+                    "bounded count equals short page count"
+                );
+                let bytes = row_bytes(&rows);
+                for _ in 0..3 {
+                    let again = query(db, model, &filters, &sorts, MAX_PAGE_LIMIT, 0).unwrap();
+                    assert_eq!(row_bytes(&again), bytes, "repeated runs are byte-identical");
+                }
+                if score_dir == "asc" && label_dir == "desc" {
+                    reference_bytes = bytes;
+                }
+            }
+        }
+    });
+    let reversed_bytes = with_query_db("query-sort-reverse", true, |db, model| {
+        let sorts = [sort_term("score", "asc"), sort_term("label", "desc")];
+        row_bytes(&query(db, model, &filters, &sorts, MAX_PAGE_LIMIT, 0).unwrap())
+    });
+    assert_eq!(
+        reference_bytes, reversed_bytes,
+        "insertion order must not change sorted bytes"
+    );
+}
+
+#[test]
+fn query_rejects_malformed_filters_with_typed_errors() {
+    with_query_db("query-malformed", false, |db, model| {
+        let unknown_field = [int_filter("missing", "=", 1)];
+        assert_typed(
+            no_panic(|| query(db, model, &unknown_field, &[], 10, 0)),
+            QueryErrorKind::UnknownField,
+            "missing",
+        );
+        assert_typed(
+            no_panic(|| count(db, model, &unknown_field, MAX_COUNT_LIMIT)),
+            QueryErrorKind::UnknownField,
+            "missing",
+        );
+        let hostile_field = [int_filter("score) OR 1=1; --", "=", 1)];
+        assert_typed(
+            no_panic(|| query(db, model, &hostile_field, &[], 10, 0)),
+            QueryErrorKind::UnknownField,
+            "invalid SQL identifier",
+        );
+        let bad_operator = [int_filter("score", "LIKE", 10)];
+        assert_typed(
+            no_panic(|| query(db, model, &bad_operator, &[], 10, 0)),
+            QueryErrorKind::UnknownOperator,
+            "LIKE",
+        );
+        let hostile_operator = [int_filter("score", "= 1 OR 1=1; --", 10)];
+        assert_typed(
+            no_panic(|| query(db, model, &hostile_operator, &[], 10, 0)),
+            QueryErrorKind::UnknownOperator,
+            "OR 1=1",
+        );
+        let string_range = [text_filter("label", ">", "alpha")];
+        assert_typed(
+            no_panic(|| query(db, model, &string_range, &[], 10, 0)),
+            QueryErrorKind::UnsupportedOperator,
+            "int fields",
+        );
+        let bool_range = [bool_filter("active", "<", true)];
+        assert_typed(
+            no_panic(|| query(db, model, &bool_range, &[], 10, 0)),
+            QueryErrorKind::UnsupportedOperator,
+            "int fields",
+        );
+        let wrong_type = [text_filter("score", "=", "ten")];
+        assert_typed(
+            no_panic(|| query(db, model, &wrong_type, &[], 10, 0)),
+            QueryErrorKind::TypeMismatch,
+            "does not match field type",
+        );
+        let bool_overflow = [Filter {
+            field: "active",
+            op: "=",
+            value: Value::Int(2),
+        }];
+        assert_typed(
+            no_panic(|| query(db, model, &bool_overflow, &[], 10, 0)),
+            QueryErrorKind::OutOfRange,
+            "0 or 1",
+        );
+        let bad_sort_field = [sort_term("missing", "asc")];
+        assert_typed(
+            no_panic(|| query(db, model, &[], &bad_sort_field, 10, 0)),
+            QueryErrorKind::UnknownField,
+            "missing",
+        );
+        let bad_direction = [sort_term("score", "asc; DROP TABLE Item; --")];
+        assert_typed(
+            no_panic(|| query(db, model, &[], &bad_direction, 10, 0)),
+            QueryErrorKind::InvalidSortDirection,
+            "DROP TABLE",
+        );
+        for (limit, offset, mention) in [
+            (0, 0, "positive integer"),
+            (MAX_PAGE_LIMIT + 1, 0, "maximum page size"),
+            (10, -1, "non-negative"),
+        ] {
+            assert_typed(
+                no_panic(|| query(db, model, &[], &[], limit, offset)),
+                QueryErrorKind::OutOfRange,
+                mention,
+            );
+        }
+        for (cap, mention) in [(0, "positive"), (MAX_COUNT_LIMIT + 1, "maximum")] {
+            assert_typed(
+                no_panic(|| count(db, model, &[], cap)),
+                QueryErrorKind::OutOfRange,
+                mention,
+            );
+        }
+        assert_eq!(
+            query(db, model, &[], &[], MAX_PAGE_LIMIT, 0).unwrap().len(),
+            25,
+            "the table survives every malformed request"
+        );
+    });
+}
+
+#[test]
+fn query_binds_hostile_text_and_works_through_transaction_guard() {
+    with_query_db("query-binding", false, |db, model| {
+        let hostile = "x' OR 1=1; DROP TABLE Item; --\0tail";
+        create(
+            db,
+            model,
+            &[
+                ("id", Value::Int(26)),
+                ("score", Value::Int(99)),
+                ("label", Value::Text(hostile.to_string())),
+                ("active", Value::Bool(true)),
+            ],
+        )
+        .unwrap();
+        let filters = [text_filter("label", "=", hostile)];
+        let rows = query(db, model, &filters, &[], 10, 0).unwrap();
+        assert_eq!(query_ids(&rows), vec![26]);
+        assert_eq!(
+            rows[0].get("label").unwrap().as_str().unwrap().as_bytes(),
+            hostile.as_bytes(),
+            "bound text is byte-exact, including NUL"
+        );
+        assert_eq!(count(db, model, &filters, MAX_COUNT_LIMIT).unwrap(), 1);
+        let tables = db
+            .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'Item';")
+            .unwrap();
+        assert_eq!(tables.len(), 1, "the bound payload cannot alter SQL");
+
+        let mut tx = db.transaction().unwrap();
+        create(
+            &mut *tx,
+            model,
+            &[
+                ("id", Value::Int(27)),
+                ("score", Value::Int(99)),
+                ("label", Value::Text("uncommitted".to_string())),
+                ("active", Value::Bool(false)),
+            ],
+        )
+        .unwrap();
+        let id_filter = [int_filter("id", "=", 27)];
+        assert_eq!(
+            query(&mut *tx, model, &id_filter, &[], 10, 0)
+                .unwrap()
+                .len(),
+            1,
+            "query sees rows inside the existing guard"
+        );
+        assert_eq!(
+            count(&mut *tx, model, &id_filter, 10).unwrap(),
+            1,
+            "count works through the existing guard"
+        );
+        tx.rollback().unwrap();
+        assert!(query(db, model, &id_filter, &[], 10, 0).unwrap().is_empty());
+
+        let dyn_db: &mut dyn Database = db;
+        assert_eq!(count(dyn_db, model, &[], MAX_COUNT_LIMIT).unwrap(), 26);
+    });
+}
