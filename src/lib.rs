@@ -11,6 +11,7 @@
 //! records applied versions in `_migrations`, and one-query eager loading of
 //! declared foreign-key relations.
 
+mod benchmark;
 mod crud;
 mod kv;
 mod memory;
@@ -35,6 +36,11 @@ mod sqlite;
 #[path = "sqlite_stub.rs"]
 mod sqlite;
 
+pub use benchmark::{
+    expected_statements, filter_keys, measure_queries, percentile_ms, speedup_x100, BenchmarkPlans,
+    BenchmarkReport, BenchmarkRunner, Clock, MonotonicClock, SqliteRunner, Workload,
+    BENCHMARK_WORKLOAD, WORKLOAD_SEED,
+};
 pub use crud::{create, create_table, delete, get, list, list_paged, update, MAX_PAGE_LIMIT};
 pub use kv::Kv;
 pub use memory::Memory;

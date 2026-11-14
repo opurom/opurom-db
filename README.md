@@ -84,6 +84,11 @@ pub trait Database {
 | `Model::relation(field, parent)` | declares a `field -> parent.id` foreign-key relation |
 | `with_related(db, model, parents, field)` | eager loads all related rows in ONE query; `BTreeMap<i64, Vec<Row>>` plus dangling-FK `Vec<ForeignKeyViolation>` |
 | `Sqlite::executed_statements()` | monotonic count of statements run through the handle, for query-count tests |
+| `measure_queries(&mut runner, workload, &mut clock) -> BenchmarkReport` | runs the fixed insert/select workload through an injected `BenchmarkRunner` and `Clock` and returns measured integer stats |
+| `BenchmarkRunner` / `SqliteRunner::new(db)` | injectable workload seam; the SQLite runner drives an existing `Sqlite` handle (use `:memory:`) |
+| `Workload { rows, selects, repeats, seed }` / `BENCHMARK_WORKLOAD` | fixed benchmark shape; `filter_keys` derives deterministic equality keys |
+| `BenchmarkReport` | measured `insert_ms`, `indexed_select_ms`, `scan_select_ms`, `rows_returned`, `statements_executed`, `speedup_x100`, p50/p95 and both plans |
+| `percentile_ms` / `speedup_x100` / `expected_statements` | pure integer helpers: nearest-rank percentile, `floor(scan*100/indexed)`, driver-call count |
 | `Transaction::commit()` / `rollback()` | explicit `COMMIT` / `ROLLBACK`; both release the driver borrow |
 
 `Row::insert(name, value)` works both in place (`let mut r = Row::new();
@@ -226,6 +231,49 @@ for the indexed table and `SCAN Plain` for an equivalent unindexed table.
 rows, so the tests bracket both measured EXPLAIN calls and both filtered
 queries with the counter and use SQLite's row-access report as the benefit
 evidence.
+
+## Indexed-versus-scan benchmark
+
+`measure_queries` turns that EXPLAIN evidence into a measured baseline instead
+of prose. It runs a fixed workload against a real in-memory SQLite database
+through the existing driver and returns measured integer stats:
+
+```rust
+let mut runner = SqliteRunner::new(Sqlite::open(":memory:")?)?;
+let report = measure_queries(&mut runner, BENCHMARK_WORKLOAD, &mut MonotonicClock)?;
+assert_eq!(report.plans.planner_indexed.scan, Scan::IndexScan);
+assert!(report.plans.sqlite_indexed.iter().any(|d| d.contains("USING INDEX")));
+assert!(report.plans.sqlite_scan.iter().any(|d| d.starts_with("SCAN")));
+```
+
+The workload is an equality filter on an indexed `score` column of one table
+and the same filter on an unindexed twin, both seeded under the deterministic
+`WORKLOAD_SEED` key mixer (`filter_keys`, no random generator). The default
+`BENCHMARK_WORKLOAD` inserts 4,096 rows into each table, runs 256 equality
+selects on each path, and repeats the whole insert-plus-select sequence seven
+times so p50/p95 have samples. `BenchmarkRunner` is the injectable seam and
+`Clock` the injectable time source: `SqliteRunner` is the production runner and
+`MonotonicClock` the host clock; a test can substitute both to check the
+harness math against hand-computed samples with no host timing.
+
+Every number in `BenchmarkReport` comes from a real execution: `insert_ms`,
+`indexed_select_ms` and `scan_select_ms` are sums over the repetitions, the
+`*_ns` fields keep the unrounded totals, `rows_returned` is summed from actual
+`Sqlite` result lengths, `statements_executed` is read from
+`Sqlite::executed_statements()` around the run, `speedup_x100` is
+`floor(scan_ns * 100 / indexed_ns)` over those measured totals, and the
+p50/p95 percentiles use integer nearest rank over the per-repetition samples.
+No "expected" value is written into the report.
+
+A ratio at or below `100` (`<= 1.0x`) is a valid measurement: at a small row
+count the index may not pay off, and the benchmark reports it honestly rather
+than fabricating a win. The plans are asserted too — the pure planner returns
+`Scan::IndexScan` for the indexed table and `Scan::TableScan` for the plain one,
+and SQLite's own `EXPLAIN QUERY PLAN` must show `SEARCH ... USING INDEX` for the
+indexed path and `SCAN` for the unindexed path. The payload column keeps the
+`SELECT *` a real table lookup: an index-only table would let SQLite answer
+from a covering index and hide the row fetch. The numbers are host-specific;
+the same workload on another machine reports different milliseconds and ratio.
 
 ## Pooled SQLite handle
 
@@ -610,6 +658,15 @@ table and its indexes, pure planner prefix/tie/empty/invalid cases, and SQLite
 `Sqlite::executed_statements()`. The existing migration, relation and filtered
 query tests remain green in the same run.
 
+Eight tests in `tests/benchmark.rs` cover the measured baseline: `speedup_x100`
+integer math, `percentile_ms` nearest rank and `filter_keys` determinism with
+injected samples, workload validation, a full `measure_queries` run against a
+hand-computed scripted clock (where every reported number is checked, not just
+non-empty), one real in-memory SQLite run that asserts both planner decisions,
+both `EXPLAIN QUERY PLAN` strings, the exact `rows_returned` and the statement
+count, and a second real run that proves the statement and row counts are
+deterministic across independent databases.
+
 Eight tests in `tests/pg_protocol.rs` cover a loopback mock server: startup
 and `Query` framing, `ParameterStatus` / `BackendKeyData` parsing, a two-row
 result with typed values and SQL NULL omission, CRUD routing through the
@@ -647,8 +704,8 @@ SHA-256 known-answer vectors, the native-password scramble, the real MySQL 8.0
 fast-auth scramble, a deterministic RSA-OAEP ciphertext, and bounded statement
 framing.
 
-`cargo test` runs 77 integration tests, 8 unit tests and 0 doc tests
-(85 total). `cargo fmt --check` passes with zero formatting changes. Sockets
+`cargo test` runs 85 integration tests, 8 unit tests and 0 doc tests
+(93 total). `cargo fmt --check` passes with zero formatting changes. Sockets
 bind to `127.0.0.1` on ephemeral ports and every server runs on background
 threads of the test process, so no external PostgreSQL or MySQL server is
 contacted and no server process is left running.
@@ -661,7 +718,9 @@ multi-field ordering and capped counts on top of the same predicate,
 deterministic/idempotent migration SQL, declared single- and multi-column
 indexes with typed validation, unique enforcement and transactional DDL
 rollback, a pure deterministic prefix planner with integer estimates, SQLite
-`EXPLAIN QUERY PLAN` index-use evidence, identifier
+`EXPLAIN QUERY PLAN` index-use evidence, a reproducible in-memory SQLite
+benchmark that measures insert and indexed-versus-scan select time, rows,
+statement count and integer speedup with asserted index/scan plans, identifier
 validation, parameter binding, `PRAGMA integrity_check` / `PRAGMA
 foreign_key_check` through the trait with typed reports, explicit transactions
 with a guard that rolls back on drop, a deterministic transactional migration
