@@ -5,10 +5,11 @@
 //! simple-query TCP frontend), [`MySqlConnection`] (pure-std MySQL v10
 //! text-query frontend), [`Kv`] (file-backed key/value store) and [`Memory`]
 //! (volatile). [`PooledDb`] shares one Mutex-serialized `Sqlite` connection
-//! between threads. IR model definitions drive type-correct CRUD SQL and
-//! deterministic migration files, a bounded filtered query layer, a
-//! transactional [`Migrator`] that records applied versions in `_migrations`,
-//! and one-query eager loading of declared foreign-key relations.
+//! between threads. IR model definitions drive type-correct CRUD SQL,
+//! deterministic migration files with declared indexes, a bounded filtered
+//! query layer and a pure index planner, a transactional [`Migrator`] that
+//! records applied versions in `_migrations`, and one-query eager loading of
+//! declared foreign-key relations.
 
 mod crud;
 mod kv;
@@ -40,13 +41,13 @@ pub use memory::Memory;
 pub use migrations::{Migration, MigrationError, Migrator};
 pub use model::{
     create_table_sql, migration_files, parse_models, parse_models_value, schema_sql, sql_literal,
-    validate_ident, validate_model, write_migrations, Field, FieldType, Model, Relation,
+    validate_ident, validate_model, write_migrations, Field, FieldType, Index, Model, Relation,
 };
 pub use mysql::{MySqlConnection, MySqlStatement};
 pub use pg::{PgConnection, PgNotification};
 pub use pgserver::{PgAuth, PgServer, PgServerOptions, PgTls};
 pub use pool::PooledDb;
-pub use queries::{count, query, Filter, Sort, MAX_COUNT_LIMIT};
+pub use queries::{count, explain, query, Filter, Plan, Query, Scan, Sort, MAX_COUNT_LIMIT};
 pub use relations::with_related;
 pub use sqlite::Sqlite;
 pub use transaction::Transaction;
@@ -105,6 +106,30 @@ impl QueryErrorKind {
             QueryErrorKind::TypeMismatch => "query value type mismatch",
             QueryErrorKind::InvalidSortDirection => "invalid query sort direction",
             QueryErrorKind::OutOfRange => "out-of-range query value",
+        }
+    }
+}
+
+/// The typed category of an index declaration validation failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexErrorKind {
+    EmptyColumns,
+    UnknownColumn,
+    DuplicateColumn,
+    DuplicateIndex,
+    InvalidIdentifier,
+    InvalidDeclaration,
+}
+
+impl IndexErrorKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            IndexErrorKind::EmptyColumns => "index has no columns",
+            IndexErrorKind::UnknownColumn => "unknown index column",
+            IndexErrorKind::DuplicateColumn => "duplicate index column",
+            IndexErrorKind::DuplicateIndex => "duplicate index",
+            IndexErrorKind::InvalidIdentifier => "invalid index identifier",
+            IndexErrorKind::InvalidDeclaration => "invalid index declaration",
         }
     }
 }
@@ -232,7 +257,7 @@ impl Row {
 
 /// A readable, non-panicking error carrying the underlying driver message,
 /// an optional SQLSTATE, an optional MySQL error code and an optional typed
-/// query validation category.
+/// query validation or index declaration category.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DbError {
     message: String,
@@ -240,6 +265,7 @@ pub struct DbError {
     mysql_code: Option<u16>,
     mysql_kind: Option<MySqlErrorKind>,
     query_kind: Option<QueryErrorKind>,
+    index_kind: Option<IndexErrorKind>,
 }
 
 impl DbError {
@@ -250,6 +276,7 @@ impl DbError {
             mysql_code: None,
             mysql_kind: None,
             query_kind: None,
+            index_kind: None,
         }
     }
 
@@ -261,6 +288,7 @@ impl DbError {
             mysql_code: None,
             mysql_kind: None,
             query_kind: None,
+            index_kind: None,
         }
     }
 
@@ -272,6 +300,7 @@ impl DbError {
             mysql_code: Some(code),
             mysql_kind: Some(MySqlErrorKind::from_code(code)),
             query_kind: None,
+            index_kind: None,
         }
     }
 
@@ -282,6 +311,18 @@ impl DbError {
             mysql_code: None,
             mysql_kind: None,
             query_kind: Some(kind),
+            index_kind: None,
+        }
+    }
+
+    pub(crate) fn with_index_error(kind: IndexErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            message: format!("{}: {}", kind.label(), message.into()),
+            sqlstate: None,
+            mysql_code: None,
+            mysql_kind: None,
+            query_kind: None,
+            index_kind: Some(kind),
         }
     }
 
@@ -307,6 +348,11 @@ impl DbError {
     /// The typed category of a query-layer validation failure.
     pub fn query_error_kind(&self) -> Option<QueryErrorKind> {
         self.query_kind
+    }
+
+    /// The typed category of an index declaration validation failure.
+    pub fn index_error_kind(&self) -> Option<IndexErrorKind> {
+        self.index_kind
     }
 }
 

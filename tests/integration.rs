@@ -443,6 +443,7 @@ fn list_paged_paginates_identically_across_runs() {
             default: None,
         }],
         relations: Vec::new(),
+        indexes: Vec::new(),
     };
     let err = list_paged(&mut db, &no_pk, 10, 0).unwrap_err();
     assert!(

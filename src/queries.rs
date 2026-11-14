@@ -1,13 +1,15 @@
-//! Filtered, deterministically ordered model queries.
+//! Filtered, deterministically ordered model queries and a pure index planner.
 //!
 //! Only validated model identifiers and whitelisted SQL tokens are formatted
 //! into statements. Runtime values, including paging bounds, are bound with `?`.
+//! [`explain`] ranks declared indexes without opening a database connection.
 
 use crate::crud::{coerce, normalize, require_primary, validate_page_bounds};
 use crate::{
-    validate_ident, validate_model, Database, DbError, Field, FieldType, Model, QueryErrorKind,
-    Row, Value, MAX_PAGE_LIMIT,
+    validate_ident, validate_model, Database, DbError, Field, FieldType, Index, Model,
+    QueryErrorKind, Row, Value, MAX_PAGE_LIMIT,
 };
+use std::collections::BTreeSet;
 
 /// Maximum number of matching rows [`count`] will materialize.
 pub const MAX_COUNT_LIMIT: i64 = MAX_PAGE_LIMIT;
@@ -206,4 +208,131 @@ pub fn count<D: Database + ?Sized>(
         .and_then(Value::as_i64)
         .ok_or_else(|| DbError::new("query count returned no numeric row"))?;
     Ok(n.min(cap))
+}
+
+/// Pure planner input: filter fields, available indexes and a caller-supplied
+/// table row count. Constructing or explaining it touches no database.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Query<'a> {
+    pub filters: Vec<Filter<'a>>,
+    pub indexes: Vec<Index>,
+    pub table_rows: u64,
+}
+
+impl<'a> Query<'a> {
+    /// Snapshot `model`'s declared indexes and `filters` for [`explain`].
+    pub fn new(model: &Model, filters: &[Filter<'a>], table_rows: u64) -> Query<'a> {
+        Query {
+            filters: filters.to_vec(),
+            indexes: model.indexes.clone(),
+            table_rows,
+        }
+    }
+}
+
+/// How [`explain`] expects rows to be reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scan {
+    TableScan,
+    IndexScan,
+}
+
+/// A deterministic, integer-only query plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Plan {
+    pub scan: Scan,
+    pub index: Option<String>,
+    pub matched_columns: usize,
+    pub estimated_rows: u64,
+}
+
+const PREFIX_DIVISOR: u64 = 10;
+
+/// Choose the best declared index without touching a database.
+///
+/// Filter fields form a case-insensitive set; operators and values do not
+/// affect ranking. A candidate matches only its leading columns, stopping at
+/// the first missing one. The longest prefix wins, ties go to the
+/// lexicographically smallest index name. Without a match, the plan is a table
+/// scan. Each matched column divides `query.table_rows` by ten using integer
+/// division (at least one row for a nonempty table); a fully matched unique
+/// index estimates at most one row.
+pub fn explain(query: &Query<'_>) -> Plan {
+    let fields = query
+        .filters
+        .iter()
+        .filter(|filter| validate_ident(filter.field).is_ok())
+        .map(|filter| filter.field.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let mut best: Option<(&Index, usize)> = None;
+    for index in &query.indexes {
+        if !usable_index(index) {
+            continue;
+        }
+        let matched = prefix_match(index, &fields);
+        if matched == 0 {
+            continue;
+        }
+        let better = best.map_or(true, |(current, current_matched)| {
+            matched > current_matched
+                || (matched == current_matched && index.name.as_str() < current.name.as_str())
+        });
+        if better {
+            best = Some((index, matched));
+        }
+    }
+    match best {
+        None => Plan {
+            scan: Scan::TableScan,
+            index: None,
+            matched_columns: 0,
+            estimated_rows: query.table_rows,
+        },
+        Some((index, matched)) => Plan {
+            scan: Scan::IndexScan,
+            index: Some(index.name.clone()),
+            matched_columns: matched,
+            estimated_rows: estimate_rows(query.table_rows, matched, index),
+        },
+    }
+}
+
+fn usable_index(index: &Index) -> bool {
+    if index.columns.is_empty() || validate_ident(&index.name).is_err() {
+        return false;
+    }
+    let mut seen = BTreeSet::new();
+    for column in &index.columns {
+        if validate_ident(column).is_err() || !seen.insert(column.to_ascii_lowercase()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn prefix_match(index: &Index, fields: &BTreeSet<String>) -> usize {
+    index
+        .columns
+        .iter()
+        .take_while(|column| {
+            let key = column.to_ascii_lowercase();
+            fields.contains(&key)
+        })
+        .count()
+}
+
+fn estimate_rows(table_rows: u64, matched: usize, index: &Index) -> u64 {
+    if index.unique && matched == index.columns.len() {
+        return table_rows.min(1);
+    }
+    // shortcut: no SQLite statistics are available; divide by 10 until ANALYZE stats exist.
+    let mut estimate = table_rows;
+    for _ in 0..matched {
+        estimate /= PREFIX_DIVISOR;
+    }
+    if estimate == 0 && table_rows > 0 {
+        1
+    } else {
+        estimate
+    }
 }

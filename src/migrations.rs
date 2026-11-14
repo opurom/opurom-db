@@ -3,11 +3,12 @@
 //! A [`Migrator`] applies numbered versions to a database in order and records
 //! each one in a `_migrations` table. Re-applying an already-applied version is
 //! a no-op, an out-of-order or missing version is a typed
-//! [`MigrationError::OutOfOrder`] / [`MigrationError::MissingVersion`], and each
+//! [`MigrationError::AppliedAhead`] / [`MigrationError::MissingVersion`], and each
 //! migration runs inside its own transaction so a failure rolls back and leaves
-//! no record behind.
+//! no record behind. [`Migration::from_model`] emits table and index DDL in one
+//! `up` body, so both are created atomically by [`Migrator::apply`].
 
-use crate::{Database, DbError};
+use crate::{create_table_sql, Database, DbError, Model};
 use std::fmt;
 
 /// One numbered migration: a stable integer `version` and its SQL `up` body.
@@ -23,6 +24,13 @@ impl Migration {
             version,
             up: up.into(),
         }
+    }
+
+    /// Build one migration whose `up` body creates `model`'s table and all of
+    /// its declared indexes. [`Migrator::apply`] executes that body in the same
+    /// transaction as the version record.
+    pub fn from_model(version: i64, model: &Model) -> Result<Migration, DbError> {
+        Ok(Migration::new(version, create_table_sql(model)?))
     }
 }
 
