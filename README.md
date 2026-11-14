@@ -63,6 +63,11 @@ pub trait Database {
 | `Row::get(&str) -> Option<&Value>` | plus `Row::new()`, `insert`, `set`, `columns`, `len`, `is_empty` |
 | `DbError` | `Display`, `Debug`, `std::error::Error`; driver message, optional `sqlstate()`, `mysql_code()` and `mysql_error_kind()` |
 | `Database::transaction()` | sends `BEGIN` and returns a guard; statements run through the guard, whose drop rolls back an open transaction |
+| `query(db, model, filters, sorts, limit, offset)` | filtered, multi-key ordered page through bound `?` parameters |
+| `count(db, model, filters, cap)` | `min(matching rows, cap)` over the same predicate as `query` |
+| `Filter { field, op, value }` | one `WHERE` term: `op` is `=`, `!=`, `<`, `<=`, `>`, `>=`; ranges are int-only |
+| `Sort { field, direction }` | one `ORDER BY` term; direction is `asc` or `desc`, primary key appended if absent |
+| `DbError::query_error_kind()` | typed query error category: unknown field/operator, unsupported operator, type mismatch, invalid sort direction, out of range |
 | `Database::integrity_check()` | default method running `PRAGMA integrity_check` through `query`; returns `IntegrityReport` with `is_ok()` and `problems()` |
 | `Database::foreign_key_check()` | default method running `PRAGMA foreign_key_check` through `query`; returns `Vec<ForeignKeyViolation>` with `table`, `rowid`, `parent` and `foreign_key`, empty when nothing is wrong |
 | `Transaction::commit()` / `rollback()` | explicit `COMMIT` / `ROLLBACK`; both release the driver borrow |
@@ -98,6 +103,41 @@ driver, so pages never depend on insertion timing or driver row order. `limit`
 must be a positive integer up to `MAX_PAGE_LIMIT` (`1000`) and `offset` must be
 non-negative — out-of-range values return a readable `DbError`. Like `get` /
 `update` / `delete`, it requires a model with a primary field.
+
+## Filtered queries
+
+```rust
+let filters = [
+    Filter { field: "score", op: ">=", value: Value::Int(40) },
+    Filter { field: "label", op: "!=", value: Value::Text("gamma".into()) },
+    Filter { field: "active", op: "=", value: Value::Bool(true) },
+];
+let sorts = [
+    Sort { field: "score", direction: "desc" },
+    Sort { field: "label", direction: "asc" },
+];
+let rows = query(&mut db, &model, &filters, &sorts, 10, 0)?;   // limit, offset
+let n = count(&mut db, &model, &filters, MAX_COUNT_LIMIT)?;    // capped count
+```
+
+`query` and `count` share one predicate builder, so a filtered count always
+equals the number of rows `query` returns for the same filters. `=` and `!=`
+work on `int`, `string` and `bool`; `<`, `<=`, `>` and `>=` are accepted only
+for `int` fields. Field names must be declared model fields and operators and
+sort directions must be in the lists above: anything else, plus a value that
+does not match the field type or a bool given a value other than 0/1, returns a
+typed `DbError` whose `query_error_kind()` names the category — nothing panics
+on a malformed filter.
+
+Every runtime value, including `limit` and `count`'s cap, is sent as a bound
+`?` parameter, not concatenated into SQL text; only validated identifiers and
+whitelisted operators and directions are formatted into the statement. `sorts`
+are applied left to right, and the primary key is appended ascending unless
+already present, so ordering is total: repeated runs and different insertion
+orders produce byte-identical pages. `limit` must be `1..=MAX_PAGE_LIMIT`,
+`offset` non-negative and `count`'s cap `1..=MAX_COUNT_LIMIT` (`1000`); `count`
+runs `SELECT COUNT(*)` over a `LIMIT ?` subquery, so it stops at the cap rather
+than scanning the whole table.
 
 ## Pooled SQLite handle
 
@@ -389,7 +429,7 @@ cargo fmt --all
 cargo test
 ```
 
-Twenty-three integration tests cover the core: SQLite CRUD round-trip against a
+Twenty-seven integration tests cover the core: SQLite CRUD round-trip against a
 temp file, deterministic pagination across repeated runs and insertion orders,
 native parameter binding with quotes, KV persistence across two
 opens, KV and Memory CRUD, migration SQL content and idempotency, malformed
@@ -400,7 +440,14 @@ transaction cases (commit, explicit rollback, rollback on drop, a failed
 commit and nested `BEGIN` rejection), the `integrity_check` report for a clean
 file and the `foreign_key_check` violation typed down to its table, `rowid`,
 parent and constraint index through `&mut dyn Database`, and both pragmas
-refused readably by the `Memory` driver.
+refused readably by the `Memory` driver. Four more cover the filtered query
+layer on a 25-row temp SQLite table: every `=`/`!=`/`<`/`<=`/`>`/`>=` operator
+on int plus string and bool equality, single- and multi-field `asc`/`desc`
+sorting with repeated-run byte identity and insertion-order independence,
+filtered and bounded counts matching page sizes, and typed rejection of unknown
+fields, unknown or range operators and out-of-range values without panicking;
+one also binds hostile text through the query layer inside the existing
+transaction guard.
 
 Eight tests in `tests/pg_protocol.rs` cover a loopback mock server: startup
 and `Query` framing, `ParameterStatus` / `BackendKeyData` parsing, a two-row
@@ -439,8 +486,8 @@ SHA-256 known-answer vectors, the native-password scramble, the real MySQL 8.0
 fast-auth scramble, a deterministic RSA-OAEP ciphertext, and bounded statement
 framing.
 
-`cargo test --offline` runs 57 integration tests, 8 unit tests and 0 doc
-tests (65 total). `cargo fmt --all` and
+`cargo test --offline` runs 61 integration tests, 8 unit tests and 0 doc
+tests (69 total). `cargo fmt --all` and
 `RUSTFLAGS="-D warnings" cargo test --offline` pass with zero warnings. Sockets
 bind to `127.0.0.1` on ephemeral ports and every server runs on background
 threads of the test process, so no external PostgreSQL or MySQL server is
@@ -449,7 +496,9 @@ contacted and no server process is left running.
 ## Status
 
 Verified: SQLite via FFI on macOS/Linux, embedded file-backed KV, in-memory
-store, typed CRUD helpers, deterministic/idempotent migration SQL, identifier
+store, typed CRUD helpers, bounded filtered queries with deterministic
+multi-field ordering and capped counts on top of the same predicate,
+deterministic/idempotent migration SQL, identifier
 validation, parameter binding, `PRAGMA integrity_check` / `PRAGMA
 foreign_key_check` through the trait with typed reports, explicit transactions
 with a guard that rolls back on drop, a Mutex-serialized shared SQLite handle

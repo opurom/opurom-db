@@ -3,7 +3,7 @@
 
 use crate::{
     create_table_sql, validate_ident, validate_model, Database, DbError, Field, FieldType, Model,
-    Row, Value,
+    QueryErrorKind, Row, Value,
 };
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -13,7 +13,7 @@ pub fn create_table<D: Database + ?Sized>(db: &mut D, model: &Model) -> Result<(
     db.exec(&create_table_sql(model)?)
 }
 
-fn coerce(value: &Value, ty: FieldType) -> Result<Value, DbError> {
+pub(crate) fn coerce(value: &Value, ty: FieldType) -> Result<Value, DbError> {
     match (ty, value) {
         (FieldType::Int, Value::Int(_)) => Ok(value.clone()),
         (FieldType::Int, Value::Bool(b)) => Ok(Value::Int(i64::from(*b))),
@@ -29,7 +29,7 @@ fn coerce(value: &Value, ty: FieldType) -> Result<Value, DbError> {
 }
 
 /// SQLite has no boolean storage class: re-map INTEGER 0/1 to Value::Bool.
-fn normalize(model: &Model, mut row: Row) -> Row {
+pub(crate) fn normalize(model: &Model, mut row: Row) -> Row {
     for f in &model.fields {
         if f.ty == FieldType::Bool {
             if let Some(b) = row.get(&f.name).and_then(Value::as_bool) {
@@ -50,7 +50,7 @@ fn next_id<D: Database + ?Sized>(db: &mut D, model: &Model, pk: &Field) -> Resul
     Ok(max + 1)
 }
 
-fn require_primary(model: &Model) -> Result<&Field, DbError> {
+pub(crate) fn require_primary(model: &Model) -> Result<&Field, DbError> {
     model.primary().ok_or_else(|| {
         DbError::new(format!(
             "model {:?} has no primary field; this operation requires one",
@@ -123,8 +123,31 @@ pub fn list<D: Database + ?Sized>(db: &mut D, model: &Model) -> Result<Vec<Row>,
     Ok(rows.into_iter().map(|r| normalize(model, r)).collect())
 }
 
-/// Upper bound for one page of [`list_paged`].
+/// Upper bound for one page of [`list_paged`] and [`crate::query`].
 pub const MAX_PAGE_LIMIT: i64 = 1000;
+
+/// Shared page bounds for deterministic list and filtered query paging.
+pub(crate) fn validate_page_bounds(limit: i64, offset: i64) -> Result<(), DbError> {
+    if limit <= 0 {
+        return Err(DbError::with_query_error(
+            QueryErrorKind::OutOfRange,
+            format!("limit must be a positive integer, got {limit}"),
+        ));
+    }
+    if limit > MAX_PAGE_LIMIT {
+        return Err(DbError::with_query_error(
+            QueryErrorKind::OutOfRange,
+            format!("limit {limit} exceeds the maximum page size {MAX_PAGE_LIMIT}"),
+        ));
+    }
+    if offset < 0 {
+        return Err(DbError::with_query_error(
+            QueryErrorKind::OutOfRange,
+            format!("offset must be non-negative, got {offset}"),
+        ));
+    }
+    Ok(())
+}
 
 /// Deterministic pagination over `model`'s rows, ascending by primary key.
 ///
@@ -141,21 +164,7 @@ pub fn list_paged<D: Database + ?Sized>(
     offset: i64,
 ) -> Result<Vec<Row>, DbError> {
     validate_model(model)?;
-    if limit <= 0 {
-        return Err(DbError::new(format!(
-            "limit must be a positive integer, got {limit}"
-        )));
-    }
-    if limit > MAX_PAGE_LIMIT {
-        return Err(DbError::new(format!(
-            "limit {limit} exceeds the maximum page size {MAX_PAGE_LIMIT}"
-        )));
-    }
-    if offset < 0 {
-        return Err(DbError::new(format!(
-            "offset must be non-negative, got {offset}"
-        )));
-    }
+    validate_page_bounds(limit, offset)?;
     let pk = require_primary(model)?;
     let mut rows = db.query(&format!("SELECT * FROM {};", model.name))?;
     rows.sort_by(|a, b| cmp_pk_cells(a.get(&pk.name), b.get(&pk.name)));
