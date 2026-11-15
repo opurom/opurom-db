@@ -156,12 +156,23 @@ fn real_pg_round_trips_the_framework_crud_helpers() {
     )
     .unwrap();
     let id = created.get("id").and_then(Value::as_i64).unwrap();
-    let fetched = get(&mut db, &post, id).unwrap().expect("created row is readable");
-    assert_eq!(fetched.get("title"), Some(&Value::Text("first post".into())));
+    let fetched = get(&mut db, &post, id)
+        .unwrap()
+        .expect("created row is readable");
+    assert_eq!(
+        fetched.get("title"),
+        Some(&Value::Text("first post".into()))
+    );
     assert_eq!(fetched.get("pinned"), Some(&Value::Bool(true)));
 
     assert!(
-        update(&mut db, &post, id, &[("title", Value::Text("edited".into()))]).unwrap(),
+        update(
+            &mut db,
+            &post,
+            id,
+            &[("title", Value::Text("edited".into()))]
+        )
+        .unwrap(),
         "updating an existing row reports success"
     );
     let edited = get(&mut db, &post, id).unwrap().unwrap();
@@ -171,8 +182,14 @@ fn real_pg_round_trips_the_framework_crud_helpers() {
     let empty_page = list_paged(&mut db, &post, 10, 1).unwrap();
     assert!(empty_page.is_empty(), "offset past the end yields no rows");
 
-    assert!(delete(&mut db, &post, id).unwrap(), "delete reports the row");
-    assert!(get(&mut db, &post, id).unwrap().is_none(), "deleted row is gone");
+    assert!(
+        delete(&mut db, &post, id).unwrap(),
+        "delete reports the row"
+    );
+    assert!(
+        get(&mut db, &post, id).unwrap().is_none(),
+        "deleted row is gone"
+    );
 }
 
 #[test]
@@ -234,22 +251,23 @@ fn real_pg_eager_loads_comments_and_reports_dangling_keys() {
     let two = create(&mut db, &post, &[("title", Value::Text("two".into()))]).unwrap();
     let one_id = one.get("id").and_then(Value::as_i64).unwrap();
     let two_id = two.get("id").and_then(Value::as_i64).unwrap();
-    for (post_id, body) in [
-        (one_id, "nice"),
-        (one_id, "agreed"),
-        (two_id, "welcome"),
-    ] {
+    for (post_id, body) in [(one_id, "nice"), (one_id, "agreed"), (two_id, "welcome")] {
         create(
             &mut db,
             &comment,
-            &[("post_id", Value::Int(post_id)), ("body", Value::Text(body.into()))],
+            &[
+                ("post_id", Value::Int(post_id)),
+                ("body", Value::Text(body.into())),
+            ],
         )
         .unwrap();
     }
     let posts = list_paged(&mut db, &post, 100, 0).unwrap();
-    let (groups, violations) =
-        with_related(&mut db, &comment, &posts, "post_id").unwrap();
-    assert!(violations.is_empty(), "no dangling keys after clean inserts");
+    let (groups, violations) = with_related(&mut db, &comment, &posts, "post_id").unwrap();
+    assert!(
+        violations.is_empty(),
+        "no dangling keys after clean inserts"
+    );
     assert_eq!(
         groups.get(&one_id).map(Vec::len),
         Some(2),
@@ -262,14 +280,20 @@ fn real_pg_eager_loads_comments_and_reports_dangling_keys() {
     let orphan = create(
         &mut db,
         &comment,
-        &[("post_id", Value::Int(999_999)), ("body", Value::Text("dangling".into()))],
+        &[
+            ("post_id", Value::Int(999_999)),
+            ("body", Value::Text("dangling".into())),
+        ],
     )
     .unwrap();
     let (groups, violations) = with_related(&mut db, &comment, &posts, "post_id").unwrap();
     assert_eq!(violations.len(), 1, "the dangling foreign key is reported");
     assert_eq!(violations[0].table, "Comment");
     assert_eq!(violations[0].parent, "Post");
-    assert_eq!(violations[0].rowid, orphan.get("id").and_then(Value::as_i64));
+    assert_eq!(
+        violations[0].rowid,
+        orphan.get("id").and_then(Value::as_i64)
+    );
     assert_eq!(groups.get(&one_id).map(Vec::len), Some(2));
 }
 
