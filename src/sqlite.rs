@@ -13,6 +13,11 @@ const SQLITE_TEXT: c_int = 3;
 const SQLITE_BLOB: c_int = 4;
 const SQLITE_NULL: c_int = 5;
 
+/// How long a statement waits for a peer connection's lock before reporting
+/// "database is locked". Short enough to surface real deadlock, long enough
+/// to ride out a concurrent transaction.
+const BUSY_TIMEOUT_MS: c_int = 5000;
+
 #[link(name = "sqlite3")]
 unsafe extern "C" {
     fn sqlite3_open(filename: *const c_char, db: *mut *mut c_void) -> c_int;
@@ -44,6 +49,7 @@ unsafe extern "C" {
     fn sqlite3_column_int64(stmt: *mut c_void, col: c_int) -> i64;
     fn sqlite3_column_text(stmt: *mut c_void, col: c_int) -> *const u8;
     fn sqlite3_column_bytes(stmt: *mut c_void, col: c_int) -> c_int;
+    fn sqlite3_busy_timeout(db: *mut c_void, ms: c_int) -> c_int;
     fn sqlite3_bind_int64(stmt: *mut c_void, index: c_int, value: i64) -> c_int;
     fn sqlite3_bind_text(
         stmt: *mut c_void,
@@ -145,6 +151,17 @@ impl Conn {
         }
         if db.is_null() {
             return Err(DbError::new("sqlite3_open returned a null handle"));
+        }
+        // Without a busy handler a writer hitting a peer's open transaction
+        // fails instantly with "database is locked"; wait out short contention
+        // so concurrent connections serialize instead of erroring.
+        let rc = unsafe { sqlite3_busy_timeout(db, BUSY_TIMEOUT_MS) };
+        if rc != SQLITE_OK {
+            let detail = errmsg(db);
+            unsafe { sqlite3_close(db) };
+            return Err(DbError::new(format!(
+                "sqlite3_busy_timeout failed: {detail}"
+            )));
         }
         Ok(Conn { db })
     }

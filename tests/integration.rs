@@ -950,6 +950,149 @@ fn sqlite_nested_transaction_begin_is_a_readable_error() {
 }
 
 #[test]
+fn sqlite_second_connection_sees_only_committed_writes() {
+    let dir = TempDir::new("tx-isolation");
+    let path = dir.path().join("iso.sqlite").to_str().unwrap().to_string();
+    let mut writer = Sqlite::open(&path).unwrap();
+    writer
+        .exec("CREATE TABLE T (id INTEGER PRIMARY KEY, v TEXT);")
+        .unwrap();
+    let mut reader = Sqlite::open(&path).unwrap();
+
+    let mut tx = writer.transaction().unwrap();
+    tx.exec("INSERT INTO T (id, v) VALUES (1, 'pending');")
+        .unwrap();
+    let rows = reader.query("SELECT COUNT(*) AS n FROM T;").unwrap();
+    assert_eq!(
+        rows[0].get("n"),
+        Some(&Value::Int(0)),
+        "an open transaction must stay invisible to a second connection"
+    );
+    tx.commit().unwrap();
+    let rows = reader.query("SELECT COUNT(*) AS n FROM T;").unwrap();
+    assert_eq!(
+        rows[0].get("n"),
+        Some(&Value::Int(1)),
+        "commit publishes the row"
+    );
+
+    let mut tx = writer.transaction().unwrap();
+    tx.exec("INSERT INTO T (id, v) VALUES (2, 'rolled back');")
+        .unwrap();
+    tx.rollback().unwrap();
+    let rows = reader.query("SELECT COUNT(*) AS n FROM T;").unwrap();
+    assert_eq!(
+        rows[0].get("n"),
+        Some(&Value::Int(1)),
+        "a rollback must stay invisible to a second connection"
+    );
+}
+
+#[test]
+fn sqlite_second_connection_write_waits_out_an_open_transaction() {
+    let dir = TempDir::new("tx-busy");
+    let path = dir.path().join("busy.sqlite").to_str().unwrap().to_string();
+    let mut holder = Sqlite::open(&path).unwrap();
+    holder
+        .exec("CREATE TABLE T (id INTEGER PRIMARY KEY);")
+        .unwrap();
+
+    let peer_path = path.clone();
+    let peer = thread::spawn(move || {
+        // Holds the write lock briefly, then commits: the blocked writer
+        // below must wait for this instead of failing with "database is locked".
+        let mut peer = Sqlite::open(&peer_path).unwrap();
+        let mut tx = peer.transaction().unwrap();
+        tx.exec("INSERT INTO T (id) VALUES (1);").unwrap();
+        thread::sleep(std::time::Duration::from_millis(200));
+        tx.commit().unwrap();
+    });
+    thread::sleep(std::time::Duration::from_millis(50));
+
+    let mut contender = Sqlite::open(&path).unwrap();
+    let started = std::time::Instant::now();
+    {
+        // A deferred BEGIN takes no lock; the INSERT is what must wait out the
+        // peer's RESERVED lock instead of failing with "database is locked".
+        let mut tx = contender.transaction().unwrap();
+        tx.exec("INSERT INTO T (id) VALUES (2);")
+            .expect("a writer waits out a peer's open transaction");
+        tx.commit().unwrap();
+    }
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(100),
+        "the write must have blocked until the peer committed"
+    );
+    peer.join().unwrap();
+
+    let rows = contender.query("SELECT COUNT(*) AS n FROM T;").unwrap();
+    assert_eq!(
+        rows[0].get("n"),
+        Some(&Value::Int(2)),
+        "both writers' rows persist"
+    );
+}
+
+#[test]
+fn sqlite_concurrent_transaction_writers_stay_atomic() {
+    let dir = TempDir::new("tx-concurrent");
+    let path = dir.path().join("race.sqlite").to_str().unwrap().to_string();
+    let mut setup = Sqlite::open(&path).unwrap();
+    setup
+        .exec("CREATE TABLE T (id INTEGER PRIMARY KEY, v TEXT);")
+        .unwrap();
+    drop(setup);
+
+    const THREADS: i64 = 4;
+    const PER_THREAD: i64 = 10;
+    const ROLLBACK_EVERY: i64 = 5;
+    let barrier = Arc::new(Barrier::new(THREADS as usize));
+    let mut handles = Vec::new();
+    for t in 0..THREADS {
+        let db_path = path.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            // Each thread owns its connection: contention is real, and every
+            // BEGIN goes through the default busy handler, not a per-test pragma.
+            let mut db = Sqlite::open(&db_path).unwrap();
+            barrier.wait();
+            for i in 0..PER_THREAD {
+                let id = t * PER_THREAD + i;
+                let mut tx = db.transaction().unwrap();
+                tx.exec_params(
+                    "INSERT INTO T (id, v) VALUES (?, ?);",
+                    &[Value::Int(id), Value::Text(format!("t{t}-{i}"))],
+                )
+                .unwrap();
+                if i % ROLLBACK_EVERY == ROLLBACK_EVERY - 1 {
+                    tx.rollback().unwrap();
+                } else {
+                    tx.commit().unwrap();
+                }
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let mut db = Sqlite::open(&path).unwrap();
+    let rows = db.query("SELECT COUNT(*) AS n FROM T;").unwrap();
+    let expected = THREADS * (PER_THREAD - PER_THREAD / ROLLBACK_EVERY);
+    assert_eq!(
+        rows[0].get("n"),
+        Some(&Value::Int(expected)),
+        "every committed transaction applied fully, every rollback left nothing"
+    );
+    let rows = db.query("SELECT COUNT(DISTINCT id) AS n FROM T;").unwrap();
+    assert_eq!(
+        rows[0].get("n"),
+        Some(&Value::Int(expected)),
+        "no id may appear twice under contention"
+    );
+}
+
+#[test]
 fn integrity_check_reports_a_clean_database_through_the_trait() {
     let dir = TempDir::new("integrity");
     let path = dir
