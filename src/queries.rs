@@ -5,6 +5,7 @@
 //! [`explain`] ranks declared indexes without opening a database connection.
 
 use crate::crud::{coerce, normalize, require_primary, validate_page_bounds};
+use crate::ident::sql_ident;
 use crate::{
     validate_ident, validate_model, Database, DbError, Field, FieldType, Index, Model,
     QueryErrorKind, Row, Value, MAX_PAGE_LIMIT,
@@ -91,7 +92,7 @@ fn predicate(model: &Model, filters: &[Filter<'_>]) -> Result<Predicate, DbError
         }
         let value = coerce(&filter.value, f.ty)
             .map_err(|e| query_error(QueryErrorKind::TypeMismatch, e.to_string()))?;
-        clauses.push(format!("{} {op} ?", f.name));
+        clauses.push(format!("{} {op} ?", sql_ident(&f.name)));
         params.push(value);
     }
     if clauses.is_empty() {
@@ -127,10 +128,10 @@ fn order_by(model: &Model, sorts: &[Sort<'_>]) -> Result<String, DbError> {
         if f.name.as_str() == pk.name.as_str() {
             has_pk = true;
         }
-        terms.push(format!("{} {direction}", f.name));
+        terms.push(format!("{} {direction}", sql_ident(&f.name)));
     }
     if !has_pk {
-        terms.push(format!("{} ASC", pk.name));
+        terms.push(format!("{} ASC", sql_ident(&pk.name)));
     }
     Ok(terms.join(", "))
 }
@@ -173,7 +174,9 @@ pub fn query<D: Database + ?Sized>(
     params.push(Value::Int(offset));
     let sql = format!(
         "SELECT * FROM {} WHERE {} ORDER BY {} LIMIT ? OFFSET ?;",
-        model.name, p.where_sql, order
+        sql_ident(&model.name),
+        p.where_sql,
+        order
     );
     Ok(db
         .query_params(&sql, &params)?
@@ -199,7 +202,8 @@ pub fn count<D: Database + ?Sized>(
     params.push(Value::Int(cap));
     let sql = format!(
         "SELECT COUNT(*) AS n FROM (SELECT 1 FROM {} WHERE {} LIMIT ?);",
-        model.name, p.where_sql
+        sql_ident(&model.name),
+        p.where_sql
     );
     let n = db
         .query_params(&sql, &params)?

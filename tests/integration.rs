@@ -608,8 +608,8 @@ fn migration_sql_content_and_idempotency() {
     assert!(sql.contains("id INTEGER PRIMARY KEY"));
     assert!(sql.contains("title TEXT"));
     assert!(sql.contains("done INTEGER DEFAULT 0"));
-    assert!(sql.contains("CREATE TABLE IF NOT EXISTS User ("));
-    assert!(sql.contains("name TEXT DEFAULT 'anon'"));
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS \"User\" ("));
+    assert!(sql.contains("\"name\" TEXT DEFAULT 'anon'"));
     assert!(sql.contains("active INTEGER DEFAULT 1"));
     let todo = fs::read_to_string(a.path().join("migrations/001_create_todo.sql")).unwrap();
     assert_eq!(
@@ -627,6 +627,95 @@ fn migration_sql_content_and_idempotency() {
         .query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;")
         .unwrap();
     assert_eq!(tables.len(), 2);
+}
+
+/// Reserved words as identifiers: the generated SQL quotes them, and SQLite
+/// executes the round trip end to end (DDL, CRUD, filtered queries).
+#[test]
+fn reserved_word_schema_roundtrips_on_sqlite() {
+    let models = parse_models(
+        r#"{"ir":"0.1.0","app":"Auth","models":[{"name":"User","fields":[
+          {"name":"id","type":"int","primary":true},
+          {"name":"order","type":"int"},
+          {"name":"group","type":"string"}
+        ]}]}"#,
+    )
+    .unwrap();
+    let sql = schema_sql(&models).unwrap();
+    assert!(
+        sql.contains("CREATE TABLE IF NOT EXISTS \"User\" ("),
+        "{sql}"
+    );
+    assert!(sql.contains("\"order\" INTEGER"), "{sql}");
+    assert!(sql.contains("\"group\" TEXT"), "{sql}");
+    // A plain model keeps its bare form, so existing assertions still hold.
+    let todo = schema_sql(&[todo_model()]).unwrap();
+    assert!(todo.contains("CREATE TABLE IF NOT EXISTS Todo ("), "{todo}");
+
+    let dir = TempDir::new("reserved-ident");
+    let mut db = Sqlite::open(dir.path().join("r.sqlite").to_str().unwrap()).unwrap();
+    db.exec(&sql).unwrap();
+    let model = &models[0];
+    create_table(&mut db, model).unwrap();
+    create(
+        &mut db,
+        model,
+        &[
+            ("order", Value::Int(3)),
+            ("group", Value::Text("admin".to_string())),
+        ],
+    )
+    .unwrap();
+    let row = get(&mut db, model, 1).unwrap().unwrap();
+    assert_eq!(row.get("order"), Some(&Value::Int(3)));
+    assert_eq!(row.get("group"), Some(&Value::Text("admin".to_string())));
+    update(&mut db, model, 1, &[("order", Value::Int(9))]).unwrap();
+    let filters = [int_filter("order", "=", 9)];
+    let sorts = [Sort {
+        field: "group",
+        direction: "asc",
+    }];
+    assert_eq!(
+        query(&mut db, model, &filters, &sorts, 10, 0)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(count(&mut db, model, &filters, 10).unwrap(), 1);
+    assert!(delete(&mut db, model, 1).unwrap());
+    assert!(get(&mut db, model, 1).unwrap().is_none());
+}
+
+/// The in-process drivers parse SQL text themselves, so they must accept the
+/// quoted identifiers the generators emit.
+#[test]
+fn reserved_word_schema_roundtrips_on_memory_driver() {
+    let models = parse_models(
+        r#"{"ir":"0.1.0","app":"Auth","models":[{"name":"User","fields":[
+          {"name":"id","type":"int","primary":true},
+          {"name":"order","type":"int"},
+          {"name":"group","type":"string"}
+        ]}]}"#,
+    )
+    .unwrap();
+    let model = &models[0];
+    let mut db = Memory::new();
+    create_table(&mut db, model).unwrap();
+    create(
+        &mut db,
+        model,
+        &[
+            ("order", Value::Int(3)),
+            ("group", Value::Text("admin".to_string())),
+        ],
+    )
+    .unwrap();
+    assert_eq!(list(&mut db, model).unwrap().len(), 1);
+    let row = get(&mut db, model, 1).unwrap().unwrap();
+    assert_eq!(row.get("group"), Some(&Value::Text("admin".to_string())));
+    update(&mut db, model, 1, &[("order", Value::Int(9))]).unwrap();
+    assert!(delete(&mut db, model, 1).unwrap());
+    assert!(list(&mut db, model).unwrap().is_empty());
 }
 
 #[test]

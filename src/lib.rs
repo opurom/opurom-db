@@ -13,6 +13,7 @@
 
 mod benchmark;
 mod crud;
+mod ident;
 mod kv;
 mod memory;
 mod migrations;

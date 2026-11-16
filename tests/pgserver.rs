@@ -204,6 +204,49 @@ fn bundled_server_routes_the_framework_crud_helpers() {
     });
 }
 
+/// Generated SQL quotes PG keywords (`User`, `order`, `group`), so the bundled
+/// server has to parse quoted table and column names back into bare ones.
+#[test]
+fn bundled_server_runs_a_reserved_word_schema() {
+    let server = plain_server();
+    let port = server.port();
+    let models = parse_models(
+        r#"{"ir":"0.1.0","models":[{"name":"User","fields":[
+          {"name":"id","type":"int","primary":true},
+          {"name":"order","type":"int"},
+          {"name":"group","type":"string"}
+        ]}]}"#,
+    )
+    .expect("test IR");
+    let model = models[0].clone();
+    bounded("reserved ident client", move || {
+        let mut db = PgConnection::connect("127.0.0.1", port, "alice", "opurom")
+            .expect("plain connection to the bundled server");
+        create_table(&mut db, &model).expect("quoted DDL");
+        create(
+            &mut db,
+            &model,
+            &[
+                ("order", Value::Int(3)),
+                ("group", Value::Text("admin".into())),
+            ],
+        )
+        .expect("quoted insert");
+        let found = get(&mut db, &model, 1i64).expect("get").expect("a row");
+        assert_eq!(found.get("order"), Some(&Value::Int(3)));
+        assert!(update(&mut db, &model, 1i64, &[("order", Value::Int(9))]).expect("quoted update"));
+        assert_eq!(
+            get(&mut db, &model, 1i64)
+                .expect("get")
+                .expect("a row")
+                .get("order"),
+            Some(&Value::Int(9))
+        );
+        assert!(delete(&mut db, &model, 1i64).expect("quoted delete"));
+        assert!(list(&mut db, &model).expect("list").is_empty());
+    });
+}
+
 #[test]
 fn bundled_server_serves_cleartext_authentication() {
     let server = PgServer::start(PgServerOptions {

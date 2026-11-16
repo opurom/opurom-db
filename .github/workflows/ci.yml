@@ -125,8 +125,8 @@ jobs:
             echo "::error::pg_integration skipped instead of running against the service"
             exit 1
           fi
-          echo "$out" | grep -q 'test result: ok\. 4 passed' || {
-            echo "::error::expected 4 passing pg_integration cases"; exit 1; }
+          echo "$out" | grep -q 'test result: ok\. 5 passed' || {
+            echo "::error::expected 5 passing pg_integration cases"; exit 1; }
           exit $status
 
   # One ping per push, after every matrix check finished green on main. The

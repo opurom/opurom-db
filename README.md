@@ -676,7 +676,7 @@ cleartext/MD5/SASL authentication, an exact 16-byte `CancelRequest` on a
 separate socket with the query connection still usable, and cancellation
 rejection when startup omitted `BackendKeyData`.
 
-Twelve tests in `tests/pgserver.rs` run the client against the bundled
+Thirteen tests in `tests/pgserver.rs` run the client against the bundled
 server over real sockets: a multi-statement `BEGIN` / `INSERT` / `SELECT` /
 `COMMIT` transaction whose committed row survives (both as separate round
 trips and as one Query message), a `ROLLBACK` transaction whose row does not,
@@ -687,9 +687,10 @@ and refused by the client, a TLS session with a trusted self-signed
 certificate that runs a full transaction over the encrypted stream, the
 rejection of an untrusted self-signed certificate, the rejection of a
 certificate that does not chain to the supplied anchor, a plaintext server
-that refuses TLS, a session that stays usable after a failed statement, and
-the `Database::transaction()` guard committing and rolling back over a real
-socket.
+that refuses TLS, a session that stays usable after a failed statement, the
+`Database::transaction()` guard committing and rolling back over a real
+socket, and a reserved-word schema whose quoted identifiers parse back into
+bare names on the wire.
 
 Fourteen integration tests in `tests/mysql_protocol.rs` speak real MySQL
 v10 bytes against loopback mock servers: the eight core cases (handshake with the

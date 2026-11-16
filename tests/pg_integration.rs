@@ -104,9 +104,13 @@ fn comment_model() -> Model {
 }
 
 /// Drop every table the suite creates, including the migration bookkeeping
-/// table, so each test starts from an empty schema.
+/// table, so each test starts from an empty schema. Keyword table names are
+/// created quoted, and a bare name folds to lowercase, so `Comment` must be
+/// dropped quoted to actually match.
 fn reset(db: &mut PgConnection) {
-    for table in ["Comment", "Post", "ForumUser", "_migrations"] {
+    db.exec("DROP TABLE IF EXISTS \"Comment\";")
+        .expect("drop table");
+    for table in ["Post", "ForumUser", "_migrations"] {
         db.exec(&format!("DROP TABLE IF EXISTS {table};"))
             .expect("drop table");
     }
@@ -313,6 +317,45 @@ fn real_pg_eager_loads_comments_and_reports_dangling_keys() {
     // the child row id: that is the key the eager load could not resolve.
     assert_eq!(violations[0].rowid, Some(999_999));
     let _ = orphan;
+}
+
+/// Reserved words as identifiers against a live server: the generated DDL
+/// quotes them, and every read path uses the same quoted form, so a model
+/// named `User` with `order`/`group` columns round-trips like any other.
+#[test]
+fn real_pg_runs_reserved_word_schema() {
+    let Some((_lock, mut db)) = pg() else { return };
+    db.exec("DROP TABLE IF EXISTS \"User\";")
+        .expect("drop table");
+    let models = parse_models(
+        r#"{"ir":"0.1.0","models":[{"name":"User","fields":[
+          {"name":"id","type":"int","primary":true},
+          {"name":"order","type":"int"},
+          {"name":"group","type":"string"}
+        ]}]}"#,
+    )
+    .unwrap();
+    let model = &models[0];
+    create_table(&mut db, model).unwrap();
+    create(
+        &mut db,
+        model,
+        &[
+            ("order", Value::Int(3)),
+            ("group", Value::Text("admin".into())),
+        ],
+    )
+    .unwrap();
+    let row = get(&mut db, model, 1).unwrap().expect("row readable");
+    assert_eq!(row.get("order"), Some(&Value::Int(3)));
+    assert_eq!(row.get("group"), Some(&Value::Text("admin".into())));
+    update(&mut db, model, 1, &[("order", Value::Int(9))]).unwrap();
+    let rows = list_paged(&mut db, model, 10, 0).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("order"), Some(&Value::Int(9)));
+    assert!(delete(&mut db, model, 1).unwrap());
+    db.exec("DROP TABLE IF EXISTS \"User\";")
+        .expect("drop table");
 }
 
 /// Create the tables for `models` through the framework helper, keeping the

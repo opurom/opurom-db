@@ -642,7 +642,7 @@ impl Session {
                 primary_key = Some(columns.len());
             }
             columns.push(Column {
-                name: parts[0].to_string(),
+                name: unquote_ident(parts[0]).to_string(),
                 type_oid,
             });
         }
@@ -677,7 +677,7 @@ impl Session {
             (
                 inner
                     .split(',')
-                    .map(|part| part.trim().to_string())
+                    .map(|part| unquote_ident(part.trim()).to_string())
                     .filter(|part| !part.is_empty())
                     .collect::<Vec<String>>(),
                 rest,
@@ -798,7 +798,7 @@ impl Session {
                     format!("malformed assignment {assignment:?}"),
                 ));
             };
-            let column = column.trim();
+            let column = unquote_ident(column.trim());
             let Some(index) = table
                 .columns
                 .iter()
@@ -831,6 +831,14 @@ impl Session {
     }
 }
 
+/// Drop one pair of surrounding double quotes from a quoted identifier.
+fn unquote_ident(text: &str) -> &str {
+    match text.strip_prefix('"') {
+        Some(inner) => inner.strip_suffix('"').unwrap_or(text),
+        None => text,
+    }
+}
+
 fn type_oid_of(declared: &str) -> i32 {
     let base = declared.split('(').next().unwrap_or(declared).trim();
     match base.to_ascii_uppercase().as_str() {
@@ -850,7 +858,7 @@ fn select_columns(table: &Table, requested: &str) -> Result<(Vec<Column>, Vec<us
     let mut columns = Vec::new();
     let mut indexes = Vec::new();
     for name in requested.split(',') {
-        let name = name.trim();
+        let name = unquote_ident(name.trim());
         let Some(index) = table
             .columns
             .iter()
@@ -948,7 +956,7 @@ fn parse_condition(rest: &str) -> Result<Condition, SqlError> {
         )
     })?;
     Ok(Condition {
-        column: Some(column.trim().to_string()),
+        column: Some(unquote_ident(column.trim()).to_string()),
         value,
     })
 }
@@ -1026,6 +1034,12 @@ fn is_identifier_byte(byte: u8) -> bool {
 }
 
 fn take_identifier(text: &str) -> (String, &str) {
+    if text.starts_with('"') {
+        return match text[1..].find('"') {
+            Some(i) => (text[1..i + 1].to_string(), &text[i + 2..]),
+            None => (text[1..].to_string(), ""),
+        };
+    }
     let mut end = 0;
     for (index, byte) in text.bytes().enumerate() {
         if is_identifier_byte(byte) || byte == b'.' {

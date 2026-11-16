@@ -6,6 +6,7 @@
 //! parent gets an entry (empty when it has no children).
 
 use crate::crud::normalize;
+use crate::ident::sql_ident;
 use crate::{
     validate_model, Database, DbError, Field, FieldType, ForeignKeyViolation, Model, Row, Value,
 };
@@ -69,7 +70,7 @@ pub fn with_related<D: Database + ?Sized>(
     let params = keys.iter().map(|id| Value::Int(*id)).collect::<Vec<_>>();
     let sql = format!(
         "SELECT * FROM {} WHERE id IN ({placeholders});",
-        relation.parent
+        sql_ident(&relation.parent)
     );
     let mut related = db.query_params(&sql, &params)?;
     // Deterministic order, independent of the driver's row order.

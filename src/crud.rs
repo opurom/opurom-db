@@ -2,8 +2,8 @@
 //! never interpolated into SQL text.
 
 use crate::{
-    create_table_sql, validate_ident, validate_model, Database, DbError, Field, FieldType, Model,
-    QueryErrorKind, Row, Value,
+    create_table_sql, ident::sql_ident, validate_ident, validate_model, Database, DbError, Field,
+    FieldType, Model, QueryErrorKind, Row, Value,
 };
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -41,7 +41,7 @@ pub(crate) fn normalize(model: &Model, mut row: Row) -> Row {
 }
 
 fn next_id<D: Database + ?Sized>(db: &mut D, model: &Model, pk: &Field) -> Result<i64, DbError> {
-    let rows = db.query(&format!("SELECT * FROM {};", model.name))?;
+    let rows = db.query(&format!("SELECT * FROM {};", sql_ident(&model.name)))?;
     let max = rows
         .iter()
         .filter_map(|r| r.get(&pk.name).and_then(Value::as_i64))
@@ -95,7 +95,7 @@ pub fn create<D: Database + ?Sized>(
     }
     let cols = values
         .iter()
-        .map(|(f, _)| f.name.as_str())
+        .map(|(f, _)| sql_ident(&f.name))
         .collect::<Vec<_>>()
         .join(", ");
     let placeholders = vec!["?"; values.len()].join(", ");
@@ -106,7 +106,9 @@ pub fn create<D: Database + ?Sized>(
     db.exec_params(
         &format!(
             "INSERT INTO {} ({}) VALUES ({});",
-            model.name, cols, placeholders
+            sql_ident(&model.name),
+            cols,
+            placeholders
         ),
         &params,
     )?;
@@ -119,7 +121,7 @@ pub fn create<D: Database + ?Sized>(
 
 pub fn list<D: Database + ?Sized>(db: &mut D, model: &Model) -> Result<Vec<Row>, DbError> {
     validate_model(model)?;
-    let rows = db.query(&format!("SELECT * FROM {};", model.name))?;
+    let rows = db.query(&format!("SELECT * FROM {};", sql_ident(&model.name)))?;
     Ok(rows.into_iter().map(|r| normalize(model, r)).collect())
 }
 
@@ -166,7 +168,7 @@ pub fn list_paged<D: Database + ?Sized>(
     validate_model(model)?;
     validate_page_bounds(limit, offset)?;
     let pk = require_primary(model)?;
-    let mut rows = db.query(&format!("SELECT * FROM {};", model.name))?;
+    let mut rows = db.query(&format!("SELECT * FROM {};", sql_ident(&model.name)))?;
     rows.sort_by(|a, b| cmp_pk_cells(a.get(&pk.name), b.get(&pk.name)));
     let skip = usize::try_from(offset).unwrap_or(usize::MAX);
     Ok(rows
@@ -203,7 +205,11 @@ pub fn get<D: Database + ?Sized, V: Into<Value>>(
     validate_model(model)?;
     let pk = require_primary(model)?;
     let id = coerce(&id.into(), pk.ty)?;
-    let sql = format!("SELECT * FROM {} WHERE {} = ?;", model.name, pk.name);
+    let sql = format!(
+        "SELECT * FROM {} WHERE {} = ?;",
+        sql_ident(&model.name),
+        sql_ident(&pk.name)
+    );
     Ok(db
         .query_params(&sql, &[id])?
         .into_iter()
@@ -240,16 +246,16 @@ pub fn update<D: Database + ?Sized, V: Into<Value>>(
             .ok_or_else(|| {
                 DbError::new(format!("unknown column {name:?} in model {:?}", model.name))
             })?;
-        sets.push(format!("{} = ?", f.name));
+        sets.push(format!("{} = ?", sql_ident(&f.name)));
         params.push(coerce(value, f.ty)?);
     }
     params.push(id);
     db.exec_params(
         &format!(
             "UPDATE {} SET {} WHERE {} = ?;",
-            model.name,
+            sql_ident(&model.name),
             sets.join(", "),
-            pk.name
+            sql_ident(&pk.name)
         ),
         &params,
     )?;
@@ -269,7 +275,11 @@ pub fn delete<D: Database + ?Sized, V: Into<Value>>(
         return Ok(false);
     }
     db.exec_params(
-        &format!("DELETE FROM {} WHERE {} = ?;", model.name, pk.name),
+        &format!(
+            "DELETE FROM {} WHERE {} = ?;",
+            sql_ident(&model.name),
+            sql_ident(&pk.name)
+        ),
         &[id],
     )?;
     Ok(true)

@@ -1,3 +1,4 @@
+use crate::ident::sql_ident;
 use crate::{DbError, IndexErrorKind, Value};
 use serde_json::Value as Json;
 use std::collections::BTreeSet;
@@ -514,10 +515,10 @@ pub fn parse_models(ir_json: &str) -> Result<Vec<Model>, DbError> {
 /// are validated by [`validate_model`] before SQL text is produced.
 pub fn create_table_sql(model: &Model) -> Result<String, DbError> {
     validate_model(model)?;
-    let mut out = format!("CREATE TABLE IF NOT EXISTS {} (\n", model.name);
+    let mut out = format!("CREATE TABLE IF NOT EXISTS {} (\n", sql_ident(&model.name));
     for (i, f) in model.fields.iter().enumerate() {
         out.push_str("    ");
-        out.push_str(&f.name);
+        out.push_str(&sql_ident(&f.name));
         out.push(' ');
         out.push_str(f.ty.sql_type());
         if f.primary {
@@ -539,11 +540,18 @@ pub fn create_table_sql(model: &Model) -> Result<String, DbError> {
         } else {
             "CREATE INDEX IF NOT EXISTS "
         });
-        out.push_str(&index.name);
+        out.push_str(&sql_ident(&index.name));
         out.push_str(" ON ");
-        out.push_str(&model.name);
+        out.push_str(&sql_ident(&model.name));
         out.push_str(" (");
-        out.push_str(&index.columns.join(", "));
+        out.push_str(
+            &index
+                .columns
+                .iter()
+                .map(|c| sql_ident(c))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
         out.push_str(");\n");
     }
     Ok(out)

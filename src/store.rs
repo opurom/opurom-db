@@ -292,6 +292,14 @@ fn strip_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
 }
 
 fn take_word(s: &str) -> (&str, &str) {
+    // A quoted identifier ends at its own closing double quote; the quotes are
+    // dropped here so every path keys rows by the same bare name as before.
+    if s.starts_with('"') {
+        return match s[1..].find('"') {
+            Some(i) => (&s[1..i + 1], s[i + 2..].trim()),
+            None => (&s[1..], ""),
+        };
+    }
     let end = s
         .find(|c: char| c.is_whitespace() || c == '(' || c == ';')
         .unwrap_or(s.len());
@@ -356,6 +364,12 @@ fn split_args(s: &str) -> Result<Vec<String>, DbError> {
 
 fn ident(s: &str) -> Result<String, DbError> {
     let s = s.trim();
+    // Column names arrive quoted from generated SQL; accept one pair of
+    // surrounding double quotes, then apply the usual bare-identifier rules.
+    let s = match s.strip_prefix('"') {
+        Some(inner) => inner.strip_suffix('"').unwrap_or(s),
+        None => s,
+    };
     validate_ident(s)?;
     Ok(s.to_string())
 }
