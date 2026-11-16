@@ -79,17 +79,68 @@ jobs:
       - name: Run ${{ matrix.check }}
         run: node .github/scripts/ci-check.mjs ${{ matrix.check }}
 
+  # Real PostgreSQL gate: a live postgres:16 service, trust auth so the wire
+  # client's AuthenticationOk path connects, then the full pg_integration suite
+  # runs as a hard requirement. The service container always sets a password env
+  # for its own init, but POSTGRES_HOST_AUTH_METHOD=trust makes those credentials
+  # unnecessary and lets the passwordless client connect.
+  postgres:
+    name: postgres-integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: opurom_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      OPUROM_TEST_PG: '1'
+      OPUROM_TEST_PG_HOST: 127.0.0.1
+      OPUROM_TEST_PG_PORT: '5432'
+      OPUROM_TEST_PG_USER: postgres
+      OPUROM_TEST_PG_DB: opurom_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install libsqlite3-dev
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - name: Run live PostgreSQL integration suite
+        # A green run must actually exercise the server: the suite exits 0 with
+        # SKIP lines when it cannot connect, so require real passing results and
+        # reject any skip marker in the same captured output.
+        run: |
+          set +e
+          out="$(cargo test --test pg_integration -- --nocapture 2>&1)"
+          status=$?
+          echo "$out"
+          if echo "$out" | grep -q 'SKIP: cannot reach PostgreSQL\|SKIP: real PostgreSQL integration disabled'; then
+            echo "::error::pg_integration skipped instead of running against the service"
+            exit 1
+          fi
+          echo "$out" | grep -q 'test result: ok\. 4 passed' || {
+            echo "::error::expected 4 passing pg_integration cases"; exit 1; }
+          exit $status
+
   # One ping per push, after every matrix check finished green on main. The
   # train recomputes its own gate, so this is only a wake-up call, not a
   # verdict. A ping failure never turns CI red.
   ci-green:
     name: notify release train
-    needs: check
+    needs: [check, postgres]
     if: >-
       ${{
         always() &&
         github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-        needs.check.result == 'success' && github.repository_owner == 'opurom' &&
+        needs.check.result == 'success' && needs.postgres.result == 'success' &&
+        github.repository_owner == 'opurom' &&
         github.event.repository.name != 'opurom-ui' &&
         github.event.repository.name != 'opurom-icons' &&
         github.event.repository.name != 'opurom-examples'

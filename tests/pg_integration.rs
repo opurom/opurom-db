@@ -23,11 +23,16 @@ use opurom_db::{
 
 const ENABLE_ENV: &str = "OPUROM_TEST_PG";
 
+/// The tests share one database and each drops/recreates its tables, so they
+/// must not overlap. This mutex serializes them within the process regardless
+/// of `--test-threads`; the guard is held for a test's whole lifetime.
+static DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Open one real PostgreSQL connection, or `None` when the environment does
 /// not opt into live-server testing. `None` makes every test print a SKIP
 /// line and pass without touching the result: the harness stays honest about
 /// what actually ran.
-fn pg() -> Option<PgConnection> {
+fn pg() -> Option<(std::sync::MutexGuard<'static, ()>, PgConnection)> {
     if std::env::var(ENABLE_ENV).as_deref() != Ok("1") {
         eprintln!(
             "SKIP: real PostgreSQL integration disabled; set {ENABLE_ENV}=1 with \
@@ -42,8 +47,12 @@ fn pg() -> Option<PgConnection> {
         .unwrap_or(5432);
     let user = std::env::var("OPUROM_TEST_PG_USER").unwrap_or_else(|_| "postgres".into());
     let database = std::env::var("OPUROM_TEST_PG_DB").unwrap_or_else(|_| "opurom_test".into());
+    // Serialize before connecting so the whole test body owns the database.
+    let lock = DB_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     match PgConnection::connect(&host, port, &user, &database) {
-        Ok(connection) => Some(connection),
+        Ok(connection) => Some((lock, connection)),
         Err(error) => {
             eprintln!(
                 "SKIP: cannot reach PostgreSQL at {host}:{port}/{database} ({error}); \
@@ -56,7 +65,7 @@ fn pg() -> Option<PgConnection> {
 
 fn user_model() -> Model {
     parse_models(
-        r#"{"ir":"0.1.0","models":[{"name":"User","fields":[
+        r#"{"ir":"0.1.0","models":[{"name":"ForumUser","fields":[
           {"name":"id","type":"int","primary":true},
           {"name":"username","type":"string"},
           {"name":"role","type":"string","default":"member"}
@@ -97,7 +106,7 @@ fn comment_model() -> Model {
 /// Drop every table the suite creates, including the migration bookkeeping
 /// table, so each test starts from an empty schema.
 fn reset(db: &mut PgConnection) {
-    for table in ["Comment", "Post", "User", "_migrations"] {
+    for table in ["Comment", "Post", "ForumUser", "_migrations"] {
         db.exec(&format!("DROP TABLE IF EXISTS {table};"))
             .expect("drop table");
     }
@@ -105,7 +114,7 @@ fn reset(db: &mut PgConnection) {
 
 #[test]
 fn real_pg_applies_migrations_and_records_versions() {
-    let Some(mut db) = pg() else { return };
+    let Some((_lock, mut db)) = pg() else { return };
     reset(&mut db);
     let models = [user_model(), post_model(), comment_model()];
     let batch: Vec<Migration> = models
@@ -120,25 +129,26 @@ fn real_pg_applies_migrations_and_records_versions() {
     // Re-applying the same batch is a no-op.
     migrator.apply(&batch).unwrap();
     assert_eq!(migrator.applied().unwrap(), vec![1, 2, 3]);
+    // Unquoted DDL folds to lowercase on PostgreSQL, so compare folded names.
     let rows = db
         .query(
             "SELECT table_name FROM information_schema.tables \
-             WHERE table_name IN ('User', 'Post', 'Comment') ORDER BY table_name;",
+             WHERE lower(table_name) IN ('forumuser', 'post', 'comment') ORDER BY table_name;",
         )
         .unwrap();
     let names: Vec<String> = rows
         .iter()
         .map(|row| match row.columns().next().map(|(_, v)| v) {
-            Some(Value::Text(name)) => name.clone(),
+            Some(Value::Text(name)) => name.to_ascii_lowercase(),
             other => panic!("unexpected table_name cell: {other:?}"),
         })
         .collect();
-    assert_eq!(names, vec!["Comment", "Post", "User"]);
+    assert_eq!(names, vec!["comment", "forumuser", "post"]);
 }
 
 #[test]
 fn real_pg_round_trips_the_framework_crud_helpers() {
-    let Some(mut db) = pg() else { return };
+    let Some((_lock, mut db)) = pg() else { return };
     reset(&mut db);
     let user = user_model();
     let post = post_model();
@@ -194,7 +204,7 @@ fn real_pg_round_trips_the_framework_crud_helpers() {
 
 #[test]
 fn real_pg_transactions_keep_multi_row_writes_atomic() {
-    let Some(mut db) = pg() else { return };
+    let Some((_lock, mut db)) = pg() else { return };
     reset(&mut db);
     let post = post_model();
     create_table_rows(&mut db, &[&post]);
@@ -241,7 +251,7 @@ fn real_pg_transactions_keep_multi_row_writes_atomic() {
 
 #[test]
 fn real_pg_eager_loads_comments_and_reports_dangling_keys() {
-    let Some(mut db) = pg() else { return };
+    let Some((_lock, mut db)) = pg() else { return };
     reset(&mut db);
     let post = post_model();
     let comment = comment_model();
@@ -262,20 +272,28 @@ fn real_pg_eager_loads_comments_and_reports_dangling_keys() {
         )
         .unwrap();
     }
-    let posts = list_paged(&mut db, &post, 100, 0).unwrap();
-    let (groups, violations) = with_related(&mut db, &comment, &posts, "post_id").unwrap();
+    let comments = list_paged(&mut db, &comment, 100, 0).unwrap();
+    assert_eq!(comments.len(), 3, "three comments inserted");
+    // with_related(child_model, child_rows, fk) maps each child's foreign-key
+    // value to the parent row it points at; every child key is present.
+    let (groups, violations) = with_related(&mut db, &comment, &comments, "post_id").unwrap();
     assert!(
         violations.is_empty(),
         "no dangling keys after clean inserts"
     );
+    assert_eq!(groups.len(), 2, "two distinct posts referenced");
+    let one_posts = groups.get(&one_id).expect("post one referenced");
+    assert_eq!(one_posts.len(), 1, "one parent row per key");
+    assert_eq!(one_posts[0].get("title"), Some(&Value::Text("one".into())));
     assert_eq!(
-        groups.get(&one_id).map(Vec::len),
-        Some(2),
-        "post one eager-loads both comments"
+        groups
+            .get(&two_id)
+            .and_then(|rows| rows.first())
+            .and_then(|r| r.get("title")),
+        Some(&Value::Text("two".into()))
     );
-    assert_eq!(groups.get(&two_id).map(Vec::len), Some(1));
 
-    // A comment pointing at a deleted post comes back as a typed violation,
+    // A comment pointing at a missing post comes back as a typed violation,
     // not a silently dropped row.
     let orphan = create(
         &mut db,
@@ -286,15 +304,15 @@ fn real_pg_eager_loads_comments_and_reports_dangling_keys() {
         ],
     )
     .unwrap();
-    let (groups, violations) = with_related(&mut db, &comment, &posts, "post_id").unwrap();
+    let comments = list_paged(&mut db, &comment, 100, 0).unwrap();
+    let (_, violations) = with_related(&mut db, &comment, &comments, "post_id").unwrap();
     assert_eq!(violations.len(), 1, "the dangling foreign key is reported");
     assert_eq!(violations[0].table, "Comment");
     assert_eq!(violations[0].parent, "Post");
-    assert_eq!(
-        violations[0].rowid,
-        orphan.get("id").and_then(Value::as_i64)
-    );
-    assert_eq!(groups.get(&one_id).map(Vec::len), Some(2));
+    // The violation carries the unmatched foreign-key value (the post id), not
+    // the child row id: that is the key the eager load could not resolve.
+    assert_eq!(violations[0].rowid, Some(999_999));
+    let _ = orphan;
 }
 
 /// Create the tables for `models` through the framework helper, keeping the
