@@ -1039,6 +1039,35 @@ fn sqlite_nested_transaction_begin_is_a_readable_error() {
 }
 
 #[test]
+fn sqlite_transaction_modes_are_explicit() {
+    let dir = TempDir::new("tx-modes");
+    let path = dir
+        .path()
+        .join("modes.sqlite")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let mut db = Sqlite::open(&path).unwrap();
+    db.exec("CREATE TABLE T (id INTEGER);").unwrap();
+
+    let mut immediate = db
+        .transaction_with_mode(TransactionMode::Immediate)
+        .unwrap();
+    immediate.exec("INSERT INTO T (id) VALUES (1);").unwrap();
+    immediate.commit().unwrap();
+
+    let mut exclusive = db
+        .transaction_with_mode(TransactionMode::Exclusive)
+        .unwrap();
+    exclusive.exec("INSERT INTO T (id) VALUES (2);").unwrap();
+    exclusive.rollback().unwrap();
+
+    let rows = db.query("SELECT id FROM T;").unwrap();
+    assert_eq!(rows.len(), 1, "only the immediate transaction committed");
+    assert_eq!(rows[0].get("id"), Some(&Value::Int(1)));
+}
+
+#[test]
 fn sqlite_second_connection_sees_only_committed_writes() {
     let dir = TempDir::new("tx-isolation");
     let path = dir.path().join("iso.sqlite").to_str().unwrap().to_string();

@@ -57,7 +57,7 @@ pub use pool::PooledDb;
 pub use queries::{count, explain, query, Filter, Plan, Query, Scan, Sort, MAX_COUNT_LIMIT};
 pub use relations::with_related;
 pub use sqlite::Sqlite;
-pub use transaction::Transaction;
+pub use transaction::{Transaction, TransactionMode};
 
 use std::fmt;
 
@@ -481,7 +481,29 @@ pub trait Database {
     where
         Self: Sized,
     {
-        Transaction::begin(self)
+        self.transaction_with_mode(TransactionMode::Deferred)
+    }
+
+    /// The `BEGIN` statement this driver uses for `mode`.
+    ///
+    /// SQLite sends `BEGIN`, `BEGIN IMMEDIATE` and `BEGIN EXCLUSIVE`;
+    /// PostgreSQL has no such modifiers, so its client keeps plain `BEGIN`.
+    fn begin_sql(&mut self, mode: TransactionMode) -> &'static str {
+        mode.begin_sql()
+    }
+
+    /// Begin with an explicit lock mode. `Immediate` and `Exclusive` send
+    /// `BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE` on SQLite; drivers without those
+    /// modifiers override [`Database::begin_sql`] (the PG client sends plain
+    /// `BEGIN`). `Deferred` is `transaction()`.
+    fn transaction_with_mode(
+        &mut self,
+        mode: TransactionMode,
+    ) -> Result<Transaction<'_, Self>, DbError>
+    where
+        Self: Sized,
+    {
+        Transaction::begin_with_mode(self, mode)
     }
 }
 

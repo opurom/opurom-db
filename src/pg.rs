@@ -7,7 +7,7 @@
 //! rustls TLS 1.2/1.3 transport that negotiates the encrypted session before
 //! the startup message.
 
-use crate::{Database, DbError, Row, Value};
+use crate::{Database, DbError, Row, TransactionMode, Value};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use std::collections::BTreeMap;
@@ -565,6 +565,12 @@ impl Database for PgConnection {
 
     fn query(&mut self, sql: &str) -> Result<Vec<Row>, DbError> {
         PgConnection::query(self, sql)
+    }
+
+    /// PostgreSQL has no `BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE` modifiers, so
+    /// every mode opens a plain transaction.
+    fn begin_sql(&mut self, _mode: TransactionMode) -> &'static str {
+        "BEGIN"
     }
 }
 

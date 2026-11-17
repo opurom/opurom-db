@@ -3,6 +3,26 @@
 use crate::{Database, DbError};
 use std::ops::{Deref, DerefMut};
 
+/// Lock timing of an explicit transaction. `Deferred` keeps the historical
+/// `BEGIN`; the other modes acquire the write lock at `BEGIN` time, like the
+/// SQLite transaction modes exposed by mature client libraries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionMode {
+    Deferred,
+    Immediate,
+    Exclusive,
+}
+
+impl TransactionMode {
+    pub(crate) fn begin_sql(self) -> &'static str {
+        match self {
+            TransactionMode::Deferred => "BEGIN",
+            TransactionMode::Immediate => "BEGIN IMMEDIATE",
+            TransactionMode::Exclusive => "BEGIN EXCLUSIVE",
+        }
+    }
+}
+
 /// A guard over one open transaction.
 ///
 /// [`Database::transaction`] sends `BEGIN` and returns this guard. Statements
@@ -16,8 +36,12 @@ pub struct Transaction<'a, D: Database + ?Sized> {
 }
 
 impl<D: Database + ?Sized> Transaction<'_, D> {
-    pub(crate) fn begin(db: &mut D) -> Result<Transaction<'_, D>, DbError> {
-        db.exec("BEGIN")?;
+    pub(crate) fn begin_with_mode(
+        db: &mut D,
+        mode: TransactionMode,
+    ) -> Result<Transaction<'_, D>, DbError> {
+        let sql = db.begin_sql(mode);
+        db.exec(sql)?;
         Ok(Transaction { db, open: true })
     }
 

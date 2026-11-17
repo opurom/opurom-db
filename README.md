@@ -337,7 +337,12 @@ tx.commit()?;                                      // COMMIT; tx.rollback() send
 
 `Database::transaction()` sends `BEGIN` and returns a `Transaction` guard that
 derefs to the driver, so the whole `Database` API, including the CRUD helpers
-and bound parameters, works inside the transaction. `commit` and `rollback`
+and bound parameters, works inside the transaction. Use
+`transaction_with_mode(TransactionMode::Immediate | Exclusive)` to send
+`BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE` on SQLite when the write lock must be
+taken at begin time; `Deferred` is the default and keeps byte-identical legacy
+SQL. PostgreSQL has no such modifiers, so its client overrides `begin_sql`
+and sends plain `BEGIN` for every mode. `commit` and `rollback`
 close it explicitly; a guard dropped while still open sends `ROLLBACK`, so an
 early return or unwind cannot leave writes half-applied. When the driver
 rejects the commit the guard stays open, so dropping it still attempts the

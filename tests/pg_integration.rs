@@ -18,7 +18,7 @@
 
 use opurom_db::{
     create, create_table, create_table_sql, delete, get, list_paged, parse_models, update,
-    with_related, Database, Migration, Migrator, Model, PgConnection, Value,
+    with_related, Database, Migration, Migrator, Model, PgConnection, TransactionMode, Value,
 };
 
 const ENABLE_ENV: &str = "OPUROM_TEST_PG";
@@ -214,7 +214,9 @@ fn real_pg_transactions_keep_multi_row_writes_atomic() {
     create_table_rows(&mut db, &[&post]);
 
     // Rollback discards both writes; the guard also covers early returns.
-    let mut rolled_back = db.transaction().unwrap();
+    let mut rolled_back = db
+        .transaction_with_mode(TransactionMode::Immediate)
+        .unwrap();
     create(
         &mut *rolled_back,
         &post,
@@ -240,7 +242,9 @@ fn real_pg_transactions_keep_multi_row_writes_atomic() {
     );
 
     // Commit applies both writes as one unit.
-    let mut committed = db.transaction().unwrap();
+    let mut committed = db
+        .transaction_with_mode(TransactionMode::Exclusive)
+        .unwrap();
     let first = create(
         &mut *committed,
         &post,
