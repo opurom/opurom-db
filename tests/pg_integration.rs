@@ -218,13 +218,19 @@ fn real_pg_transactions_keep_multi_row_writes_atomic() {
     create(
         &mut *rolled_back,
         &post,
-        &[("title", Value::Text("never committed".into()))],
+        &[
+            ("user_id", Value::Int(1)),
+            ("title", Value::Text("never committed".into())),
+        ],
     )
     .unwrap();
     create(
         &mut *rolled_back,
         &post,
-        &[("title", Value::Text("also never".into()))],
+        &[
+            ("user_id", Value::Int(1)),
+            ("title", Value::Text("also never".into())),
+        ],
     )
     .unwrap();
     rolled_back.rollback().unwrap();
@@ -238,13 +244,19 @@ fn real_pg_transactions_keep_multi_row_writes_atomic() {
     let first = create(
         &mut *committed,
         &post,
-        &[("title", Value::Text("kept one".into()))],
+        &[
+            ("user_id", Value::Int(1)),
+            ("title", Value::Text("kept one".into())),
+        ],
     )
     .unwrap();
     create(
         &mut *committed,
         &post,
-        &[("title", Value::Text("kept two".into()))],
+        &[
+            ("user_id", Value::Int(1)),
+            ("title", Value::Text("kept two".into())),
+        ],
     )
     .unwrap();
     committed.commit().unwrap();
@@ -261,8 +273,24 @@ fn real_pg_eager_loads_comments_and_reports_dangling_keys() {
     let comment = comment_model();
     create_table_rows(&mut db, &[&post, &comment]);
 
-    let one = create(&mut db, &post, &[("title", Value::Text("one".into()))]).unwrap();
-    let two = create(&mut db, &post, &[("title", Value::Text("two".into()))]).unwrap();
+    let one = create(
+        &mut db,
+        &post,
+        &[
+            ("user_id", Value::Int(1)),
+            ("title", Value::Text("one".into())),
+        ],
+    )
+    .unwrap();
+    let two = create(
+        &mut db,
+        &post,
+        &[
+            ("user_id", Value::Int(2)),
+            ("title", Value::Text("two".into())),
+        ],
+    )
+    .unwrap();
     let one_id = one.get("id").and_then(Value::as_i64).unwrap();
     let two_id = two.get("id").and_then(Value::as_i64).unwrap();
     for (post_id, body) in [(one_id, "nice"), (one_id, "agreed"), (two_id, "welcome")] {
