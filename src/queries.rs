@@ -90,8 +90,14 @@ fn predicate(model: &Model, filters: &[Filter<'_>]) -> Result<Predicate, DbError
                 }
             }
         }
-        let value = coerce(&filter.value, f.ty)
-            .map_err(|e| query_error(QueryErrorKind::TypeMismatch, e.to_string()))?;
+        let value = coerce(&filter.value, &model.name, &f.name, f.ty).map_err(|e| {
+            let key = e.field().map(str::to_string);
+            let mut err = query_error(QueryErrorKind::TypeMismatch, e.message());
+            if let Some(key) = key {
+                err = err.with_field(key);
+            }
+            err
+        })?;
         clauses.push(format!("{} {op} ?", sql_ident(&f.name)));
         params.push(value);
     }

@@ -1420,6 +1420,51 @@ fn assert_typed<T>(result: Result<T, DbError>, kind: QueryErrorKind, mention: &s
 }
 
 #[test]
+fn create_rejects_missing_required_field_with_context() {
+    let mut db = Memory::new();
+    let model = todo_model();
+    create_table(&mut db, &model).unwrap();
+    let err = create(&mut db, &model, &[("done", Value::Bool(true))]).unwrap_err();
+    let message = err.message();
+    for part in ["Todo", "title", "string", "missing"] {
+        assert!(message.contains(part), "{message}");
+    }
+    assert_eq!(err.field(), Some("Todo.title"));
+}
+
+#[test]
+fn create_and_get_reject_implicit_bool_int_conversions() {
+    let mut db = Memory::new();
+    let model = todo_model();
+    create_table(&mut db, &model).unwrap();
+    let cases: [(&[(&str, Value)], &str, &str); 2] = [
+        (
+            &[
+                ("id", Value::Bool(true)),
+                ("title", Value::Text("x".into())),
+            ],
+            "id",
+            "int",
+        ),
+        (
+            &[("title", Value::Text("x".into())), ("done", Value::Int(1))],
+            "done",
+            "bool",
+        ),
+    ];
+    for (fields, field, expected) in cases {
+        let err = create(&mut db, &model, fields).unwrap_err();
+        let message = err.message();
+        for part in ["Todo", field, expected, "got"] {
+            assert!(message.contains(part), "{message}");
+        }
+        assert_eq!(err.field(), Some(format!("Todo.{field}").as_str()));
+    }
+    let err = get(&mut db, &model, Value::Bool(true)).unwrap_err();
+    assert_eq!(err.field(), Some("Todo.id"));
+}
+
+#[test]
 fn filtered_query_covers_every_operator_on_25_rows() {
     let cases: Vec<(Filter<'static>, Vec<i64>)> = vec![
         (int_filter("score", "=", 20), vec![3, 8, 13, 18, 23]),
@@ -1601,7 +1646,13 @@ fn query_rejects_malformed_filters_with_typed_errors() {
         assert_typed(
             no_panic(|| query(db, model, &wrong_type, &[], 10, 0)),
             QueryErrorKind::TypeMismatch,
-            "does not match field type",
+            "expected int",
+        );
+        let err = no_panic(|| query(db, model, &wrong_type, &[], 10, 0)).unwrap_err();
+        assert_eq!(
+            err.field(),
+            Some(format!("{}.score", model.name).as_str()),
+            "field-level errors keep the model.field key"
         );
         let bool_overflow = [Filter {
             field: "active",

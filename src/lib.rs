@@ -268,6 +268,7 @@ impl Row {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DbError {
     message: String,
+    field: Option<String>,
     sqlstate: Option<String>,
     mysql_code: Option<u16>,
     mysql_kind: Option<MySqlErrorKind>,
@@ -279,6 +280,7 @@ impl DbError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            field: None,
             sqlstate: None,
             mysql_code: None,
             mysql_kind: None,
@@ -291,6 +293,7 @@ impl DbError {
     pub fn with_sqlstate(sqlstate: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            field: None,
             sqlstate: Some(sqlstate.into()),
             mysql_code: None,
             mysql_kind: None,
@@ -303,6 +306,7 @@ impl DbError {
     pub fn with_mysql_error(code: u16, sqlstate: Option<&str>, message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            field: None,
             sqlstate: sqlstate.map(str::to_string),
             mysql_code: Some(code),
             mysql_kind: Some(MySqlErrorKind::from_code(code)),
@@ -314,6 +318,7 @@ impl DbError {
     pub(crate) fn with_query_error(kind: QueryErrorKind, message: impl Into<String>) -> Self {
         Self {
             message: format!("{}: {}", kind.label(), message.into()),
+            field: None,
             sqlstate: None,
             mysql_code: None,
             mysql_kind: None,
@@ -325,6 +330,7 @@ impl DbError {
     pub(crate) fn with_index_error(kind: IndexErrorKind, message: impl Into<String>) -> Self {
         Self {
             message: format!("{}: {}", kind.label(), message.into()),
+            field: None,
             sqlstate: None,
             mysql_code: None,
             mysql_kind: None,
@@ -333,8 +339,19 @@ impl DbError {
         }
     }
 
+    /// Attach the `model.field` key of the bad value, when one is known.
+    pub(crate) fn with_field(mut self, field: impl Into<String>) -> Self {
+        self.field = Some(field.into());
+        self
+    }
+
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// The `model.field` key of a value-level failure, when one is known.
+    pub fn field(&self) -> Option<&str> {
+        self.field.as_deref()
     }
 
     /// The SQLSTATE code, when the driver reported one.

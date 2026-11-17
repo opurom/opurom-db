@@ -112,8 +112,10 @@ let ok = update(&mut db, &model, 1, &[("done", Value::Bool(true))])?;
 let ok = delete(&mut db, &model, 1)?;         // bool: a row existed
 ```
 
-`create` fills missing columns with the declared IR default, then with the
-type zero value (`0` / `""` / `false`). An omitted `int` primary key is
+`create` fills missing columns with the declared IR default; a missing column
+without a default fails with a typed `DbError` carrying the model, field,
+expected type and the missing value. Values must match their declared type:
+no implicit bool/int conversion. An omitted `int` primary key is
 auto-assigned as `max(id) + 1`. Supplied column names are validated against
 the model and the identifier rule `[A-Za-z_][A-Za-z0-9_]*`.
 

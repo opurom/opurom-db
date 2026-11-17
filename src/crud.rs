@@ -13,19 +13,34 @@ pub fn create_table<D: Database + ?Sized>(db: &mut D, model: &Model) -> Result<(
     db.exec(&create_table_sql(model)?)
 }
 
-pub(crate) fn coerce(value: &Value, ty: FieldType) -> Result<Value, DbError> {
+pub(crate) fn coerce(
+    value: &Value,
+    model: &str,
+    field: &str,
+    ty: FieldType,
+) -> Result<Value, DbError> {
     match (ty, value) {
-        (FieldType::Int, Value::Int(_)) => Ok(value.clone()),
-        (FieldType::Int, Value::Bool(b)) => Ok(Value::Int(i64::from(*b))),
-        (FieldType::Text, Value::Text(_)) => Ok(value.clone()),
-        (FieldType::Bool, Value::Bool(_)) => Ok(value.clone()),
-        (FieldType::Bool, Value::Int(0)) => Ok(Value::Bool(false)),
-        (FieldType::Bool, Value::Int(1)) => Ok(Value::Bool(true)),
+        (FieldType::Int, Value::Int(_))
+        | (FieldType::Text, Value::Text(_))
+        | (FieldType::Bool, Value::Bool(_)) => Ok(value.clone()),
         _ => Err(DbError::new(format!(
-            "value {value:?} does not match field type {}",
+            "model {model:?} field {field:?} expected {}, got {value:?}",
             ty.as_str()
-        ))),
+        ))
+        .with_field(format!("{model}.{field}"))),
     }
+}
+
+/// A required field with no declared default and no supplied value is an
+/// error, never a zero value: a zero silently writes bad data.
+fn missing_value(model: &Model, field: &Field) -> DbError {
+    DbError::new(format!(
+        "model {:?} field {:?} expected {} but value is missing",
+        model.name,
+        field.name,
+        field.ty.as_str()
+    ))
+    .with_field(format!("{}.{}", model.name, field.name))
 }
 
 /// SQLite has no boolean storage class: re-map INTEGER 0/1 to Value::Bool.
@@ -59,8 +74,9 @@ pub(crate) fn require_primary(model: &Model) -> Result<&Field, DbError> {
     })
 }
 
-/// Insert a row. Missing fields fall back to the declared default, then to the
-/// type's zero value; an omitted int primary key gets `max(id) + 1`.
+/// Insert a row. Missing fields fall back to the declared default, or fail
+/// with a typed error carrying the model, field, expected type and the
+/// missing value; an omitted int primary key gets `max(id) + 1`.
 pub fn create<D: Database + ?Sized>(
     db: &mut D,
     model: &Model,
@@ -84,11 +100,11 @@ pub fn create<D: Database + ?Sized>(
     for f in &model.fields {
         let supplied = fields.iter().find(|(n, _)| *n == f.name.as_str());
         let value = match supplied {
-            Some((_, v)) => coerce(v, f.ty)?,
+            Some((_, v)) => coerce(v, &model.name, &f.name, f.ty)?,
             None => match &f.default {
                 Some(d) => d.clone(),
                 None if f.primary && f.ty == FieldType::Int => Value::Int(next_id(db, model, f)?),
-                None => f.ty.zero(),
+                None => return Err(missing_value(model, f)),
             },
         };
         values.push((f, value));
@@ -204,7 +220,7 @@ pub fn get<D: Database + ?Sized, V: Into<Value>>(
 ) -> Result<Option<Row>, DbError> {
     validate_model(model)?;
     let pk = require_primary(model)?;
-    let id = coerce(&id.into(), pk.ty)?;
+    let id = coerce(&id.into(), &model.name, &pk.name, pk.ty)?;
     let sql = format!(
         "SELECT * FROM {} WHERE {} = ?;",
         sql_ident(&model.name),
@@ -226,7 +242,7 @@ pub fn update<D: Database + ?Sized, V: Into<Value>>(
 ) -> Result<bool, DbError> {
     validate_model(model)?;
     let pk = require_primary(model)?;
-    let id = coerce(&id.into(), pk.ty)?;
+    let id = coerce(&id.into(), &model.name, &pk.name, pk.ty)?;
     for (name, _) in fields {
         validate_ident(name)?;
     }
@@ -247,7 +263,7 @@ pub fn update<D: Database + ?Sized, V: Into<Value>>(
                 DbError::new(format!("unknown column {name:?} in model {:?}", model.name))
             })?;
         sets.push(format!("{} = ?", sql_ident(&f.name)));
-        params.push(coerce(value, f.ty)?);
+        params.push(coerce(value, &model.name, &f.name, f.ty)?);
     }
     params.push(id);
     db.exec_params(
@@ -270,7 +286,7 @@ pub fn delete<D: Database + ?Sized, V: Into<Value>>(
 ) -> Result<bool, DbError> {
     validate_model(model)?;
     let pk = require_primary(model)?;
-    let id = coerce(&id.into(), pk.ty)?;
+    let id = coerce(&id.into(), &model.name, &pk.name, pk.ty)?;
     if get(db, model, id.clone())?.is_none() {
         return Ok(false);
     }
