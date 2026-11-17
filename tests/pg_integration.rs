@@ -17,8 +17,8 @@
 //! and recreate their tables, so point them at a dedicated database.
 
 use opurom_db::{
-    create, create_table, delete, get, list_paged, parse_models, update, with_related, Database,
-    Migration, Migrator, Model, PgConnection, Value,
+    create, create_table, create_table_sql, delete, get, list_paged, parse_models, update,
+    with_related, Database, Migration, Migrator, Model, PgConnection, Value,
 };
 
 const ENABLE_ENV: &str = "OPUROM_TEST_PG";
@@ -384,6 +384,45 @@ fn real_pg_runs_reserved_word_schema() {
     assert!(delete(&mut db, model, 1).unwrap());
     db.exec("DROP TABLE IF EXISTS \"User\";")
         .expect("drop table");
+}
+
+/// A framework-generated keyword table is quoted (`"Comment"`); bare SQL
+/// folds to lowercase `comment` and misses it. The synthesis is the only
+/// safe way to spell identifiers in hand-written SQL.
+#[test]
+fn real_pg_keyword_tables_require_generated_identifier_synthesis() {
+    let Some((_lock, mut db)) = pg() else { return };
+    // Clear both spellings left by earlier runs.
+    db.exec("DROP TABLE IF EXISTS \"Comment\";").unwrap();
+    db.exec("DROP TABLE IF EXISTS Comment;").unwrap();
+    let model = parse_models(
+        r#"{"ir":"0.1.0","models":[{"name":"Comment","fields":[
+          {"name":"id","type":"int","primary":true},
+          {"name":"body","type":"string"}
+        ]}]}"#,
+    )
+    .unwrap()
+    .pop()
+    .unwrap();
+    let ddl = create_table_sql(&model).unwrap();
+    assert!(
+        ddl.contains("CREATE TABLE IF NOT EXISTS \"Comment\" ("),
+        "{ddl}"
+    );
+    create_table(&mut db, &model).unwrap();
+    create(&mut db, &model, &[("body", Value::Text("quoted".into()))]).unwrap();
+
+    let bare = db.query("SELECT COUNT(*) AS n FROM Comment;").unwrap_err();
+    assert_eq!(
+        bare.sqlstate(),
+        Some("42P01"),
+        "bare name must miss: {bare}"
+    );
+    let quoted = db.query("SELECT COUNT(*) AS n FROM \"Comment\";").unwrap();
+    assert_eq!(quoted[0].get("n"), Some(&Value::Int(1)));
+    assert_eq!(list_paged(&mut db, &model, 10, 0).unwrap().len(), 1);
+
+    db.exec("DROP TABLE IF EXISTS \"Comment\";").unwrap();
 }
 
 /// Create the tables for `models` through the framework helper, keeping the

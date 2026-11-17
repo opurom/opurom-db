@@ -311,6 +311,16 @@ only supplies the shared handle.
 - All generated identifiers are validated; text literals use single quotes
   with doubled interior quotes (`O'Reilly` becomes `'O''Reilly'`). Bound
   parameters (`?`) are preferred where values are supplied directly.
+- **Hard rule:** hand-written SQL against framework tables must use the same
+  identifier synthesis (`src/ident.rs`) or the CRUD/query helpers — never a
+  bare model/field name. A name in the 499-word PG keyword set is emitted
+  double-quoted (`Comment` -> `"Comment"`); PostgreSQL folds bare `Comment`
+  to `comment`, so a hand-written `DROP TABLE IF EXISTS Comment;` drops
+  nothing and `SELECT ... FROM Comment;` fails with SQLSTATE `42P01`. The
+  live regression `real_pg_keyword_tables_require_generated_identifier_synthesis`
+  pins this behavior. `sql_ident_lit` (escaping identifiers for Rust source
+  string literals) belongs to the codegen repo; this crate builds SQL at
+  runtime with `format!` and has no literal-embedding path.
 - SQL `NULL` is omitted from `Row` (there is no null variant in `Value`);
   `Row::get` then returns `None`. SQLite `FLOAT` and `BLOB` columns are
   exposed as their text representation.
